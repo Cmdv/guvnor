@@ -94,6 +94,20 @@ pub fn run(id: &str, tx: &Sender<Progress>) -> Result<i32> {
         );
     }
     let log = events::EventLog::new(&run_dir);
+    // This run will overwrite both patches, so any tick on them was for a diff
+    // that is about to stop existing. `approval_checks` would catch it at the
+    // commit anyway; clearing here is what keeps the run screen honest in the
+    // meantime. A run that dies before writing a patch loses a tick it could
+    // have kept, which costs one re-approval on a run being redone regardless.
+    if st.gates.tests.approved || st.gates.work.approved {
+        st.gates.tests = Default::default();
+        st.gates.work = Default::default();
+        st.save(&run_dir)?;
+        log.append(
+            "gate_reset",
+            json!({"gate": "tests,work", "why": "re-run — the lanes write fresh patches"}),
+        )?;
+    }
     let test_cmd = &sp.verification;
     let timeout = Duration::from_secs(cfg.limits.lane_timeout_secs);
 

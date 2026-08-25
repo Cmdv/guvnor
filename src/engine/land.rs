@@ -4,15 +4,21 @@ pub fn set_gate(id: &str, gate: state::Gate, note: &str, approve: bool) -> Resul
     let repo = config::find_repo_root()?;
     let run_dir = state::resolve_run_dir(&repo, id)?;
     let mut st = State::load(&run_dir)?;
+    if approve {
+        if gate == state::Gate::Spec {
+            Spec::load(&run_dir.join("spec.json"))?; // re-validate after human edits
+        }
+        // Bind the approval to the bytes on screen. Nothing to hash means there
+        // is nothing to approve yet.
+        let bytes = std::fs::read(run_dir.join(gate.artifact()))
+            .with_context(|| format!("{} missing — nothing to approve yet", gate.artifact()))?;
+        st.gates.slot_mut(gate).sha256 = digest::sha256_hex(&bytes);
+    }
     let slot = st.gates.slot_mut(gate);
     slot.approved = approve;
     slot.ts = events::now_iso();
     slot.note = note.to_string();
     if approve && gate == state::Gate::Spec {
-        // Re-validate after human edits and bind the approval to this exact content.
-        Spec::load(&run_dir.join("spec.json"))?;
-        let bytes = std::fs::read(run_dir.join("spec.json"))?;
-        st.gates.spec.sha256 = digest::sha256_hex(&bytes);
         st.status = Status::SpecApproved;
         // Spec accepted — close the iterating planner session.
         st.planner_session_id.clear();
@@ -55,6 +61,20 @@ fn approval_checks(run_dir: &Path, st: &State) -> Result<(String, String)> {
     for (name, a) in [("spec", &st.gates.spec), ("tests", &st.gates.tests), ("work", &st.gates.work)] {
         if !a.approved {
             bail!("gate '{name}' not approved — approve all three first");
+        }
+    }
+    // Each of these two gates approves one patch. Without the digest a re-run's
+    // fresh patches inherit yesterday's ticks: the run writes a new review.json
+    // as well, so the combined check below would pass on a diff nobody read.
+    for gate in [state::Gate::Tests, state::Gate::Work] {
+        let bytes = std::fs::read(run_dir.join(gate.artifact()))
+            .with_context(|| format!("{} missing", gate.artifact()))?;
+        if digest::sha256_hex(&bytes) != st.gates.slot(gate).sha256 {
+            bail!(
+                "{} is not what the {} gate approved — read it again and re-approve",
+                gate.artifact(),
+                gate.as_str()
+            );
         }
     }
     let review: review::Review =
@@ -362,9 +382,14 @@ mod land_tests {
         };
         std::fs::write(run_dir.join("review.json"), serde_json::to_string(&review).unwrap())
             .unwrap();
+        // Approved the way set_gate approves: a tick plus a digest of the bytes
+        // that were on screen.
         let mut st = State::new(id, "landing");
-        for g in [&mut st.gates.spec, &mut st.gates.tests, &mut st.gates.work] {
-            g.approved = true;
+        st.gates.spec.approved = true;
+        for (gate, patch) in [(state::Gate::Tests, &tests_patch), (state::Gate::Work, &impl_patch)] {
+            let a = st.gates.slot_mut(gate);
+            a.approved = true;
+            a.sha256 = digest::sha256_hex(patch.as_bytes());
         }
         st.status = Status::Reviewed;
         st.save(&run_dir).unwrap();
@@ -397,10 +422,39 @@ mod land_tests {
         let (repo, id) = fixture_verdict("verdict-tamper", review::Decision::Approved);
         let run_dir = state::resolve_run_dir(&repo, &id).unwrap();
         std::fs::write(run_dir.join("impl.patch"), "tampered\n").unwrap();
-        assert!(
-            stage_at(&repo, &id).unwrap_err().to_string().contains("do not match"),
-            "the digest binding is what protects a landing"
+        let e = stage_at(&repo, &id).unwrap_err().to_string();
+        assert!(e.contains("impl.patch is not what the work gate approved"), "{e}");
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// A re-run rewrites both patches AND the review.json that digests them, so
+    /// the combined check alone would wave the new diff through on yesterday's
+    /// ticks. Each gate binding to its own patch is what refuses it.
+    #[test]
+    fn a_rerun_cannot_inherit_the_previous_approvals() {
+        let (repo, id) = fixture("rerun");
+        let run_dir = state::resolve_run_dir(&repo, &id).unwrap();
+        // Everything a fresh run leaves behind: two patches that are not the
+        // approved ones, and a verdict whose digest matches them exactly. Both
+        // still apply cleanly, so only the gate bindings can refuse them.
+        let (tests, imp) = (
+            std::fs::read_to_string(run_dir.join("impl.patch")).unwrap(),
+            std::fs::read_to_string(run_dir.join("tests.patch")).unwrap(),
         );
+        std::fs::write(run_dir.join("tests.patch"), &tests).unwrap();
+        std::fs::write(run_dir.join("impl.patch"), &imp).unwrap();
+        let mut review: review::Review =
+            serde_json::from_str(&std::fs::read_to_string(run_dir.join("review.json")).unwrap())
+                .unwrap();
+        review.diff_sha256 = digest::sha256_hex(format!("{tests}\n{imp}").as_bytes());
+        std::fs::write(run_dir.join("review.json"), serde_json::to_string(&review).unwrap())
+            .unwrap();
+
+        let e = stage_at(&repo, &id).unwrap_err().to_string();
+        assert!(e.contains("tests.patch is not what the tests gate approved"), "{e}");
+        assert!(e.contains("re-approve"), "must name the way out: {e}");
+        // and nothing reached the tree behind the refusal
+        assert_eq!(git::git(&repo, &["status", "--porcelain"]).unwrap().trim(), "");
         std::fs::remove_dir_all(&repo).ok();
     }
 

@@ -9,8 +9,9 @@ pub struct Approval {
     pub ts: String,
     #[serde(default)]
     pub note: String,
-    /// For the spec gate: sha256 of spec.json at approval time. Runs refuse
-    /// a spec edited after approval — approvals bind to content, not files.
+    /// sha256 of the gate's artifact at approval time (see `Gate::artifact`).
+    /// Approvals bind to content, not to files: a run refuses a spec edited
+    /// after approval, and a landing refuses a patch rewritten after one.
     #[serde(default)]
     pub sha256: String,
 }
@@ -38,9 +39,27 @@ impl Gate {
             Gate::Work => "work",
         }
     }
+
+    /// The run-dir file holding the exact bytes this gate approves. Hashing it
+    /// is what binds the approval to what the human actually read.
+    pub fn artifact(self) -> &'static str {
+        match self {
+            Gate::Spec => "spec.json",
+            Gate::Tests => "tests.patch",
+            Gate::Work => "impl.patch",
+        }
+    }
 }
 
 impl Gates {
+    pub fn slot(&self, gate: Gate) -> &Approval {
+        match gate {
+            Gate::Spec => &self.spec,
+            Gate::Tests => &self.tests,
+            Gate::Work => &self.work,
+        }
+    }
+
     pub fn slot_mut(&mut self, gate: Gate) -> &mut Approval {
         match gate {
             Gate::Spec => &mut self.spec,
