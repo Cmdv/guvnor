@@ -1,8 +1,7 @@
 //! The spec as boxes, and the popup that iterates it.
 //!
-//! There is no spec *screen* any more: a run has one screen, and the spec is
-//! its first tab. Everything here is drawn by `case.rs` — the panels on the
-//! Spec tab, the `Prompt` when you press `i`.
+//! A run has one screen; the spec is its first tab. Everything here is drawn
+//! by `case.rs` — the panels on the Spec tab, the `Prompt` when you press `i`.
 
 use crate::spec::Spec;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
@@ -76,7 +75,7 @@ impl SpecPanels {
 /// when there isn't — the boxes survive the resize either way, because losing
 /// them turned the spec back into the wall of text they exist to break up.
 ///
-/// Wide (owner): objective │ files · interfaces │ constraints, then verification
+/// Wide: objective │ files · interfaces │ constraints, then verification
 /// and the acceptance criteria on the full width. Those two are what the run is
 /// judged against — one is the command that decides it, the other the numbered
 /// sentences the reviewer scores — so neither gets squeezed into half a screen.
@@ -107,8 +106,8 @@ pub fn render_spec_panels(f: &mut Frame, area: Rect, sp: &Spec, p: &SpecPanels) 
     // proportional, so the room comes off the tallest row — which is the
     // criteria list, capped here for the same reason. Neither hides anything:
     // every box has its own number and its own scroll.
-    // ponytail: two constants, tuned by eye. A per-section weight table is the
-    // upgrade if the spec ever grows a section that wants its own rule.
+    // Two constants because there are two rows that need one: the spec's
+    // five parts are fixed by doctrine, not a list that grows.
     if let Some(w) = weights.first_mut() {
         *w = (*w).max(10);
     }
@@ -173,20 +172,16 @@ mod tests {
     fn screen_of(w: u16, h: u16, p: &SpecPanels, sp: &Spec) -> String {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| render_spec_panels(f, Rect::new(0, 0, w, h), sp, p)).unwrap();
-        let b = t.backend().buffer();
-        (0..h)
-            .map(|y| (0..w).map(|x| b[(x, y)].symbol().to_string()).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n")
+        screen_text(t.backend().buffer())
     }
 
     fn screen(w: u16, h: u16, p: &SpecPanels) -> String {
         screen_of(w, h, p, &spec())
     }
 
-    /// Every section keeps its box at every size. It used to collapse to one
-    /// column of text below a threshold, which is the wall of text the boxes
-    /// exist to break up.
+    /// Every section keeps its box at every size. Narrow stacks the boxes; it
+    /// never collapses them to prose — that is the wall of text the boxes exist
+    /// to break up.
     #[test]
     fn every_section_keeps_its_box_at_any_size() {
         let p = SpecPanels::default();

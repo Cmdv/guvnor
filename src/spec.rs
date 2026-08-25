@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// The five-part spec (Foreman doctrine): Objective, Files, Interfaces,
+/// The five-part spec: Objective, Files, Interfaces,
 /// Constraints, Verification — plus acceptance criteria the reviewer scores.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Spec {

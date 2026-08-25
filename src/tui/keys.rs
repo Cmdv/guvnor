@@ -206,7 +206,7 @@ impl App {
                             // A committed run's evidence is the record behind a
                             // commit that already exists — that one stays. Every
                             // other run is yours to bin.
-                            if status == "committed" {
+                            if status == state::Status::Committed {
                                 self.toast = toast("that run is committed — its evidence is the record");
                             } else {
                                 self.confirm_delete =

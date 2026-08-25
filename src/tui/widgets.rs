@@ -2,11 +2,12 @@
 //! text, a block of text, a row of buttons, and a scroll offset that knows where
 //! its content ends.
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
+use std::cell::Cell;
 
 use super::*;
 
@@ -39,13 +40,37 @@ impl Scroll {
     }
 }
 
-// ---- tiny line input (ponytail: chars+backspace+arrows; no word jumps) ----
+// ---- tiny line input: chars, backspace, arrows, ctrl+arrows by word ----
 
 #[derive(Default)]
 pub struct LineInput {
     pub value: String,
     pub cursor: usize, // char index
     pub max: usize,    // 0 = unlimited
+}
+
+/// The word boundary before `at`: back over any spaces, then back over the
+/// word itself. Mirrored by `next_word` for the other direction.
+fn prev_word(chars: &[char], at: usize) -> usize {
+    let mut i = at;
+    while i > 0 && chars[i - 1] == ' ' {
+        i -= 1;
+    }
+    while i > 0 && chars[i - 1] != ' ' {
+        i -= 1;
+    }
+    i
+}
+
+fn next_word(chars: &[char], at: usize) -> usize {
+    let mut i = at;
+    while i < chars.len() && chars[i] == ' ' {
+        i += 1;
+    }
+    while i < chars.len() && chars[i] != ' ' {
+        i += 1;
+    }
+    i
 }
 
 impl LineInput {
@@ -62,6 +87,7 @@ impl LineInput {
     }
 
     pub fn handle(&mut self, key: &KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char(c) => {
                 if self.max > 0 && self.value.chars().count() >= self.max {
@@ -76,6 +102,14 @@ impl LineInput {
                 let i = self.byte_index();
                 self.value.remove(i);
             }
+            KeyCode::Left if ctrl => {
+                let chars: Vec<char> = self.value.chars().collect();
+                self.cursor = prev_word(&chars, self.cursor);
+            }
+            KeyCode::Right if ctrl => {
+                let chars: Vec<char> = self.value.chars().collect();
+                self.cursor = next_word(&chars, self.cursor);
+            }
             KeyCode::Left if self.cursor > 0 => self.cursor -= 1,
             KeyCode::Right if self.cursor < self.value.chars().count() => self.cursor += 1,
             _ => {}
@@ -83,17 +117,26 @@ impl LineInput {
     }
 }
 
-// ---- tiny multiline input (ponytail: no wrap-aware cursor, no selections) --
+// ---- tiny multiline input: chars, backspace, arrows, shift to select ----
 
 pub struct TextArea {
     pub lines: Vec<String>,
     pub row: usize,
     pub col: usize, // char index
+    /// The other end of a selection while shift extends one; `None` outside
+    /// a selection.
+    pub anchor: Option<(usize, usize)>,
+    /// The width `render_textarea` last drew at, so `handle` can move the
+    /// cursor by a wrapped row instead of a logical line — the same `Cell`
+    /// trick `Scroll` uses: render knows the width, the key handler doesn't.
+    /// Wide enough pre-render that nothing wraps, so ↑/↓ still walk logical
+    /// lines until the first frame sets the real one.
+    w: Cell<usize>,
 }
 
 impl Default for TextArea {
     fn default() -> Self {
-        Self { lines: vec![String::new()], row: 0, col: 0 }
+        Self { lines: vec![String::new()], row: 0, col: 0, anchor: None, w: Cell::new(9999) }
     }
 }
 
@@ -213,19 +256,56 @@ pub fn hang_wrap_all(lines: &[Line<'static>], w: usize) -> Vec<Line<'static>> {
     lines.iter().flat_map(|l| hang_wrap(l, w)).collect()
 }
 
-/// Draw a `TextArea` soft-wrapped in `area`, keeping the cursor row in view.
-/// Every multiline input wants exactly this; none of them should own the
+/// Horizontal scroll for a one-line input drawn in `w` columns: the column
+/// offset that keeps the cursor on-screen, and the column the cursor lands on.
+/// One definition, so the drawn slice and the cursor cannot disagree.
+pub fn hscroll(cursor: usize, w: usize) -> (u16, u16) {
+    let off = cursor.saturating_sub(w.saturating_sub(1));
+    (off as u16, (cursor - off) as u16)
+}
+
+/// Draw a `TextArea` soft-wrapped in `area`, keeping the cursor row in view
+/// and, while there's a selection, painting it in reverse video. Every
+/// multiline input wants exactly this; none of them should own the
 /// arithmetic.
 pub fn render_textarea(f: &mut Frame, area: Rect, t: &TextArea, focused: bool) {
-    let (rows, (cr, cc)) = t.wrapped(area.width as usize);
+    let w = (area.width as usize).max(1);
+    t.w.set(w);
+    let (rows, (cr, cc)) = t.wrapped(w);
     let off = cr.saturating_sub(area.height.saturating_sub(1) as usize);
-    f.render_widget(Paragraph::new(rows.join("\n")).scroll((off as u16, 0)), area);
+    let text: Vec<Line> = match t.anchor {
+        Some(anchor) if anchor != (t.row, t.col) => {
+            let a = t.wrap_pos(w, anchor.0, anchor.1);
+            let (start, end) = if a <= (cr, cc) { (a, (cr, cc)) } else { ((cr, cc), a) };
+            rows.iter().enumerate().map(|(r, s)| select_span(s, r, start, end)).collect()
+        }
+        _ => rows.iter().cloned().map(Line::raw).collect(),
+    };
+    f.render_widget(Paragraph::new(text).scroll((off as u16, 0)), area);
     if focused {
         f.set_cursor_position(ratatui::layout::Position::new(
             area.x + cc as u16,
             area.y + (cr - off) as u16,
         ));
     }
+}
+
+/// One wrapped row, with the `[start, end)` selection (in wrapped row/col)
+/// picked out in reverse video.
+fn select_span(s: &str, r: usize, start: (usize, usize), end: (usize, usize)) -> Line<'static> {
+    if r < start.0 || r > end.0 {
+        return Line::raw(s.to_string());
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let a = (if r == start.0 { start.1 } else { 0 }).min(chars.len());
+    let b = (if r == end.0 { end.1 } else { chars.len() }).min(chars.len());
+    let sel = Style::new().bg(Color::White).fg(Color::Black);
+    let spans: Vec<Span> = [(&chars[..a], Style::new()), (&chars[a..b], sel), (&chars[b..], Style::new())]
+        .into_iter()
+        .filter(|(cs, _)| !cs.is_empty())
+        .map(|(cs, st)| Span::styled(cs.iter().collect::<String>(), st))
+        .collect();
+    Line::from(spans)
 }
 
 impl TextArea {
@@ -236,7 +316,7 @@ impl TextArea {
         let lines = if lines.is_empty() { vec![String::new()] } else { lines };
         let row = lines.len() - 1;
         let col = char_count(&lines[row]);
-        Self { lines, row, col }
+        Self { lines, row, col, anchor: None, w: Cell::new(9999) }
     }
 
     pub fn byte_index(line: &str, col: usize) -> usize {
@@ -276,17 +356,97 @@ impl TextArea {
         (out, at)
     }
 
+    /// Where (row, col) sits among the wrapped rows at width `w` — the same
+    /// mapping `wrapped` uses for the cursor, so a selection's other end
+    /// lines up with what's drawn. Cruder than `wrapped`'s own cursor
+    /// mapping (no spill row at an exact width boundary); close enough for a
+    /// selection's far edge, which is never the cursor itself.
+    fn wrap_pos(&self, w: usize, row: usize, col: usize) -> (usize, usize) {
+        let w = w.max(1);
+        let mut start = 0;
+        for (r, line) in self.lines.iter().enumerate() {
+            let rows = wrap_line(line, w);
+            if r == row {
+                let k = rows.iter().rposition(|(off, _)| *off <= col).unwrap_or(0);
+                return (start + k, col - rows[k].0);
+            }
+            start += rows.len();
+        }
+        (start, 0)
+    }
+
+    /// Move by one wrapped row (the row the box actually draws) rather than
+    /// one logical line, so ↑/↓ track what's on screen even once a line has
+    /// wrapped.
+    fn move_visual_row(&mut self, w: usize, d: i32) {
+        let (wrow, wcol) = self.wrap_pos(w, self.row, self.col);
+        let target = wrow as i32 + d;
+        if target < 0 {
+            return;
+        }
+        let mut acc = 0i32;
+        for (r, line) in self.lines.iter().enumerate() {
+            let rows = wrap_line(line, w);
+            let n = rows.len() as i32;
+            if target < acc + n {
+                let (off, text) = &rows[(target - acc) as usize];
+                self.row = r;
+                self.col = off + wcol.min(char_count(text));
+                return;
+            }
+            acc += n;
+        }
+        // Past the last row: rest at the very end of the text.
+        self.row = self.lines.len() - 1;
+        self.col = char_count(&self.lines[self.row]);
+    }
+
+    /// Remove the selection, if there is one, and leave the cursor where it
+    /// started. Returns whether there was one to remove, so `Backspace` can
+    /// skip its usual single-char delete when this already did the work.
+    fn delete_selection(&mut self) -> bool {
+        let Some(anchor) = self.anchor.take() else { return false };
+        let (start, end) =
+            if anchor <= (self.row, self.col) { (anchor, (self.row, self.col)) } else { ((self.row, self.col), anchor) };
+        if start == end {
+            return false;
+        }
+        let end_i = Self::byte_index(&self.lines[end.0], end.1);
+        let tail = self.lines[end.0].split_off(end_i);
+        let start_i = Self::byte_index(&self.lines[start.0], start.1);
+        self.lines[start.0].truncate(start_i);
+        self.lines[start.0].push_str(&tail);
+        self.lines.drain(start.0 + 1..=end.0);
+        self.row = start.0;
+        self.col = start.1;
+        true
+    }
+
     /// ⇧↵ splits the line. Bare ↵ is left to the caller — in every box this
     /// lives in, it means "done", and a newline you have to ask for is cheaper
     /// than a submit you didn't.
+    ///
+    /// Shift+arrows extend a selection from wherever the cursor was when
+    /// shift first went down; typing or deleting with one active replaces it,
+    /// the same as any text box. Anything else collapses it — a moved cursor
+    /// with no shift held means "start fresh", not "keep the old selection".
     pub fn handle(&mut self, key: &KeyEvent) {
+        let arrow = matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down);
+        if arrow && key.modifiers.contains(KeyModifiers::SHIFT) {
+            self.anchor.get_or_insert((self.row, self.col));
+        } else if arrow {
+            self.anchor = None;
+        }
+        let w = self.w.get();
         match key.code {
             KeyCode::Char(c) => {
+                self.delete_selection();
                 let i = Self::byte_index(&self.lines[self.row], self.col);
                 self.lines[self.row].insert(i, c);
                 self.col += 1;
             }
             KeyCode::Enter if key.modifiers.intersects(newline_mods()) => {
+                self.delete_selection();
                 let i = Self::byte_index(&self.lines[self.row], self.col);
                 let rest = self.lines[self.row].split_off(i);
                 self.lines.insert(self.row + 1, rest);
@@ -294,6 +454,9 @@ impl TextArea {
                 self.col = 0;
             }
             KeyCode::Backspace => {
+                if self.delete_selection() {
+                    return;
+                }
                 if self.col > 0 {
                     self.col -= 1;
                     let i = Self::byte_index(&self.lines[self.row], self.col);
@@ -321,14 +484,8 @@ impl TextArea {
                     self.col = 0;
                 }
             }
-            KeyCode::Up if self.row > 0 => {
-                self.row -= 1;
-                self.col = self.col.min(char_count(&self.lines[self.row]));
-            }
-            KeyCode::Down if self.row + 1 < self.lines.len() => {
-                self.row += 1;
-                self.col = self.col.min(char_count(&self.lines[self.row]));
-            }
+            KeyCode::Up => self.move_visual_row(w, -1),
+            KeyCode::Down => self.move_visual_row(w, 1),
             _ => {}
         }
     }
@@ -417,14 +574,16 @@ pub fn scrolled(s: &mut Scroll, d: i32) -> Option<Go> {
     None
 }
 
-/// Put text on the system clipboard. No dependency: every desktop ships a tool
-/// that reads stdin, and the terminal is the wrong place to reimplement one.
+/// Put text on the system clipboard. No dependency: every desktop ships a
+/// tool that reads stdin, and the terminal is the wrong place to reimplement
+/// one. First tool that exists wins; with none installed, falls back to
+/// OSC 52 — the terminal's own clipboard escape, and the one that still
+/// works over ssh, since it asks whatever terminal is on the far end rather
+/// than the box guvnor is actually running on.
 /// Returns what to tell the human — success or the reason it couldn't.
 pub fn clipboard(text: &str) -> Result<(), String> {
     use std::io::Write;
     use std::process::{Command, Stdio};
-    // ponytail: first tool that exists wins. OSC 52 would also work over ssh —
-    // add it if anyone actually runs guvnor on a remote box.
     const TOOLS: [(&str, &[&str]); 4] = [
         ("pbcopy", &[]),                                   // macOS
         ("wl-copy", &[]),                                  // wayland
@@ -451,13 +610,67 @@ pub fn clipboard(text: &str) -> Result<(), String> {
         }
         return Err(format!("{bin} failed"));
     }
-    Err("no clipboard tool found (pbcopy / wl-copy / xclip / xsel)".into())
+    let mut out = std::io::stdout();
+    out.write_all(osc52_sequence(text, std::env::var_os("TMUX").is_some()).as_bytes())
+        .and_then(|_| out.flush())
+        .map_err(|e| e.to_string())
+}
+
+/// The OSC 52 escape that asks the terminal to set its own clipboard, base64
+/// per the spec. Under tmux it has to be wrapped in a passthrough envelope
+/// with its own escapes doubled, or tmux swallows it before it reaches the
+/// real terminal.
+fn osc52_sequence(text: &str, in_tmux: bool) -> String {
+    let payload = format!("\x1b]52;c;{}\x07", base64(text.as_bytes()));
+    if in_tmux {
+        format!("\x1bPtmux;{}\x1b\\", payload.replace('\x1b', "\x1b\x1b"))
+    } else {
+        payload
+    }
+}
+
+/// RFC 4648 base64 with padding — just enough for OSC 52, not worth a
+/// dependency for.
+fn base64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        out.push(T[(b[0] >> 2) as usize] as char);
+        out.push(T[(((b[0] & 0x03) << 4) | (b[1] >> 4)) as usize] as char);
+        out.push(if chunk.len() > 1 { T[(((b[1] & 0x0f) << 2) | (b[2] >> 6)) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(b[2] & 0x3f) as usize] as char } else { '=' });
+    }
+    out
 }
 
 /// A bare key press. Two test modules drive key handlers, and both need it.
 #[cfg(test)]
 pub fn press(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, ratatui::crossterm::event::KeyModifiers::NONE)
+}
+
+/// A rendered buffer as text, rows joined with newlines — the screen dump the
+/// render tests grep. (`theme` and `text` are leaves and keep local copies.)
+#[cfg(test)]
+pub fn screen_text(buf: &ratatui::buffer::Buffer) -> String {
+    let a = buf.area;
+    (0..a.height)
+        .map(|y| (0..a.width).map(|x| buf[(a.x + x, a.y + y)].symbol()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// One styled line, flattened to its text.
+#[cfg(test)]
+pub fn line_text(l: &Line<'_>) -> String {
+    l.spans.iter().map(|s| s.content.as_ref()).collect()
+}
+
+/// Styled lines flattened to text, one row per line.
+#[cfg(test)]
+pub fn lines_text(lines: &[Line<'_>]) -> String {
+    lines.iter().map(line_text).collect::<Vec<_>>().join("\n")
 }
 
 #[cfg(test)]
@@ -473,7 +686,7 @@ mod tests {
         ]);
         let rows = hang_wrap(&line, 12);
         assert!(rows.len() >= 2, "should wrap: {rows:?}");
-        let text = |l: &Line| l.spans.iter().map(|s| s.content.to_string()).collect::<String>();
+        let text = line_text;
         assert!(text(&rows[0]).starts_with("‣ "), "row 0 keeps the marker");
         for r in &rows[1..] {
             let t = text(r);
@@ -514,6 +727,21 @@ mod tests {
     }
 
     #[test]
+    fn line_input_ctrl_arrows_jump_by_word() {
+        let mut i = LineInput::with("hello world foo");
+        i.cursor = 0;
+        i.handle(&KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
+        assert_eq!(i.cursor, 5, "after 'hello'");
+        i.handle(&KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
+        assert_eq!(i.cursor, 11, "after 'world'");
+        i.handle(&KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
+        assert_eq!(i.cursor, 6, "back to the start of 'world'");
+        // plain arrows still move one character, unaffected
+        i.handle(&KeyEvent::from(KeyCode::Right));
+        assert_eq!(i.cursor, 7);
+    }
+
+    #[test]
     fn textarea_newline_and_join() {
         use ratatui::crossterm::event::KeyModifiers;
         let shift_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
@@ -533,8 +761,7 @@ mod tests {
         assert_eq!((t.row, t.col), (0, 1));
     }
 
-    /// The reported bug: a long line ran off the right edge instead of
-    /// continuing on the next row, so you could not see what you had typed.
+    /// A long line must continue on the next row, not run off the right edge.
     #[test]
     fn a_long_line_wraps_and_the_cursor_follows_it() {
         let mut t = TextArea::from("abcdefghij");
@@ -555,6 +782,60 @@ mod tests {
         assert_eq!(t2.wrapped(4), (vec!["ab".into(), "".into(), "cd".into()], (2, 2)));
         // nothing typed yet: one row, cursor at the origin
         assert_eq!(TextArea::default().wrapped(10), (vec![String::new()], (0, 0)));
+    }
+
+    #[test]
+    fn up_down_follow_the_wrapped_row_not_the_logical_line() {
+        let mut t = TextArea::from("abcdefgh");
+        t.w.set(4); // one logical line, two wrapped rows: "abcd" / "efgh"
+        t.col = 6; // second wrapped row, at 'g'
+        t.handle(&KeyEvent::from(KeyCode::Up));
+        assert_eq!((t.row, t.col), (0, 2), "same column, one wrapped row up");
+        t.handle(&KeyEvent::from(KeyCode::Down));
+        assert_eq!((t.row, t.col), (0, 6), "back down to where it started");
+
+        // a real second logical line is one more wrapped row past the first
+        // line's own wrap, not a jump straight to it
+        let mut t2 = TextArea::from("abcdefgh\nZ");
+        t2.w.set(4);
+        t2.row = 0;
+        t2.col = 2; // first wrapped row of line 0
+        t2.handle(&KeyEvent::from(KeyCode::Down));
+        assert_eq!((t2.row, t2.col), (0, 6), "still line 0, its second wrapped row");
+        t2.handle(&KeyEvent::from(KeyCode::Down));
+        assert_eq!((t2.row, t2.col), (1, 1), "now line 1, clamped to its length");
+    }
+
+    #[test]
+    fn shift_arrows_select_and_typing_replaces_it() {
+        let mut t = TextArea::from("hello world");
+        t.col = 0;
+        for _ in 0..5 {
+            t.handle(&KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
+        }
+        assert_eq!(t.anchor, Some((0, 0)), "anchor pinned where shift first went down");
+        assert_eq!((t.row, t.col), (0, 5));
+        t.handle(&KeyEvent::from(KeyCode::Char('X'))); // types over the selection
+        assert_eq!(t.value(), "X world");
+        assert_eq!(t.anchor, None, "consumed");
+        assert_eq!((t.row, t.col), (0, 1));
+
+        // a selection spanning a newline joins across it, same as backspace does
+        let mut t2 = TextArea::from("ab\ncd");
+        t2.row = 0;
+        t2.col = 1;
+        t2.handle(&KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT)); // selects "b\nc"
+        t2.handle(&KeyEvent::from(KeyCode::Backspace));
+        assert_eq!(t2.value(), "ad");
+
+        // an unshifted arrow collapses the selection instead of acting on it
+        let mut t3 = TextArea::from("hello");
+        t3.col = 0;
+        t3.handle(&KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
+        t3.handle(&KeyEvent::from(KeyCode::Right));
+        assert_eq!(t3.anchor, None);
+        t3.handle(&KeyEvent::from(KeyCode::Backspace));
+        assert_eq!(t3.value(), "hllo", "backspace removed one char, not the old selection");
     }
 
     #[test]
@@ -642,6 +923,24 @@ mod tests {
         // destructive rows put the safe answer at 0
         let mut d = Buttons::new(&["cancel", "delete"], YES_NO);
         assert_eq!(d.handle(KeyCode::Enter), Some(0));
+    }
+
+    #[test]
+    fn base64_matches_known_vectors() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn osc52_wraps_for_tmux_and_doubles_its_own_escapes() {
+        let plain = osc52_sequence("hi", false);
+        assert!(plain.starts_with("\x1b]52;c;") && plain.ends_with('\u{7}'), "{plain:?}");
+        let wrapped = osc52_sequence("hi", true);
+        assert!(wrapped.starts_with("\x1bPtmux;\x1b\x1b]52;c;"), "{wrapped:?}");
+        assert!(wrapped.ends_with("\x1b\\"), "{wrapped:?}");
     }
 
 }

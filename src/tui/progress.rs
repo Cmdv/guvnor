@@ -72,7 +72,7 @@ impl App {
         };
         if let Some(j) = &self.job {
             // The gate pipeline strip is a run concept; plan/replan has no gates
-            // (a bare strip made the plan screen look empty — its stages show below).
+            // — its stages show below.
             let is_run = matches!(j.kind, JobKind::Run);
             if is_run {
                 // pipeline map: where we are, what's done, what failed

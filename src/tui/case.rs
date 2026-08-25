@@ -29,13 +29,16 @@ use super::*;
 /// a stage of the journey, so it appears only when there is one.
 ///
 /// Landing is NOT a tab. It lives as a box at the foot of the `Review` tab that
-/// `s` jumps to and focuses; the box is muted until every gate is green. A Stage
-/// tab whose whole body was a prompt to press a key was a stop that went nowhere.
+/// `s` jumps to and focuses; the box is muted until every gate is green. A whole
+/// tab for one keypress would be a stop that goes nowhere.
 pub const TABS: [&str; 5] = ["Spec", "Tests", "Work", "Review", "Failure"];
 
-/// The tabs with no gate behind them.
+/// Tab with no gate behind it: the reviewer's report, read on the way to a
+/// judgement, never approved.
 pub const REVIEW_TAB: usize = 3;
 
+/// Tab with no gate behind it: failure evidence, drawn only while the run is
+/// broken.
 pub const FAIL_TAB: usize = 4;
 
 pub fn tab_gate(tab: usize) -> state::Gate {
@@ -46,22 +49,16 @@ pub fn tab_gate(tab: usize) -> state::Gate {
     }
 }
 
-/// The failure a run is *in*, or `None`. Read from `status` — the log keeps
-/// every failure forever, but a failure that has been fixed is history, not a
-/// state, and a tab telling you what to do about it would be telling you to fix
-/// something that already works. A rejected gate was never a failure at all.
-pub fn active_failure(dir: &std::path::Path, st: &State) -> Option<(String, String)> {
-    let Status::Failed(why) = &st.status else { return None };
-    if why.starts_with("rejected_") {
-        return None;
-    }
-    // Detail comes from the log; a `why` with nothing logged still earns a tab,
-    // because the run is still broken either way.
-    let detail = last_failure(dir)
-        .filter(|(logged, _)| logged == why)
-        .map(|(_, d)| d)
-        .unwrap_or_default();
-    Some((why.clone(), detail))
+/// sha256 of `spec.json` as it sits on disk; `None` when unreadable.
+fn spec_sha(dir: &std::path::Path) -> Option<String> {
+    std::fs::read(dir.join("spec.json")).ok().map(|b| digest::sha256_hex(&b))
+}
+
+/// Whether the spec on disk no longer hashes to `pin` — the sha recorded when
+/// a run cut its patches, or when the spec gate was approved. An empty pin
+/// means nothing was recorded, so nothing has drifted.
+fn spec_drifted(sha: Option<&str>, pin: &str) -> bool {
+    !pin.is_empty() && sha.is_some_and(|s| s != pin)
 }
 
 /// What the confirm modal is asking. The gate ask judges the tab you're on;
@@ -81,16 +78,14 @@ pub struct CaseView {
     pub tab: usize,
     pub scroll: Scroll,
     pub note: Option<LineInput>,
-    /// Spec iteration: feedback → planner revision. Lived on the spec screen
-    /// until that screen was folded into the Spec tab.
+    /// Spec iteration: feedback → planner revision.
     pub feedback: Option<Prompt>,
     /// Run name, then any warning flags. Left of the state, which sits hard
-    /// right — so the gap between them is where a warning shows up (owner).
+    /// right — so the gap between them is where a warning shows up.
     pub info: Line<'static>,
     /// The status chip, right-aligned on the same row.
     pub status: Line<'static>,
-    /// The one thing to do next, always on screen. It used to be a 4-second
-    /// toast, so "approve the spec, now press r" was gone before you read it.
+    /// The one thing to do next, always on screen.
     pub next: Line<'static>,
     /// The Spec tab's body when `spec` is `None` — the only case where that tab
     /// is prose rather than boxes.
@@ -102,8 +97,8 @@ pub struct CaseView {
     pub spec: Option<Spec>,
     /// Cursor and scrolls for those boxes.
     pub panels: SpecPanels,
-    /// Per-tab approval, drawn as a ✓ on the tab itself — the gate chips used
-    /// to live in a separate box; the tab you judged is the honest place for it.
+    /// Per-tab approval, drawn as a ✓ on the tab itself — the tab you judged is
+    /// the honest place for it.
     pub approved: [bool; 3],
     /// The reviewer's report as the last tab. `None` = never reviewed. Boxed
     /// because it is by far the biggest thing in `Screen`.
@@ -131,88 +126,6 @@ pub struct CaseView {
     pub staged: bool,
 }
 
-/// The Failure tab's body: the reason from `state.json`, the evidence from
-/// `events.ndjson`, so it survives a restart. `None` once the run is no longer
-/// failed — a fixed error is not something to keep offering advice about.
-pub fn build_fail_tab(dir: &std::path::Path, st: &State) -> Option<Vec<Line<'static>>> {
-    let (why, detail) = active_failure(dir, st)?;
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled(" run failed: ", Style::new().fg(Color::Red).bold()),
-            Span::styled(why.clone(), Style::new().fg(Color::Red).bold()),
-        ]),
-        Line::raw(""),
-    ];
-    lines.extend(detail.lines().map(|l| failure_line(strip_wt_paths(l).as_str())));
-    // A fix round's failure is a conflict between a finding and a test, so the
-    // finding is half the evidence. The Review tab's ticks are gone by now.
-    let ticked = last_ticked(dir);
-    if why == "fix_broke_tests" && !ticked.is_empty() {
-        lines.push(Line::raw(""));
-        lines.push(rule("the findings this round was told to fix", Color::Yellow));
-        for t in &ticked {
-            lines.push(Line::styled(format!("  · {t}"), Style::new().fg(Color::Cyan)));
-        }
-    }
-    lines.push(Line::raw(""));
-    lines.push(rule("what to do", Color::Yellow));
-    for l in failure_advice(&why, &detail).lines() {
-        lines.push(Line::styled(format!("  {l}"), Style::new().fg(Color::Yellow)));
-    }
-    Some(lines)
-}
-
-/// The one thing the old failure screen never said. A machine reason and a
-/// stack trace don't tell you which key to press, and its only exit was the
-/// spec screen — so every failure looked like "rewrite the spec", including the
-/// ones where that is the wrong move.
-pub fn failure_advice(why: &str, detail: &str) -> &'static str {
-    // A lane that coded its refusal has already said which move fixes it —
-    // that beats guessing from the failure class.
-    if detail.contains("CANNOT/SPEC") {
-        return "the lane refused because your instruction contradicts the spec, and only\nthe planner can change the spec. Go to the Review tab (←), keep the same\ninstruction, and pick `change the spec` instead of `fix the code`.";
-    }
-    if detail.contains("CANNOT/FENCED") {
-        return "the lane refused because it needs an edit it is blocked from making —\ntests are written by an independent lane and it may never touch them. That\nis a spec change: Review tab (←), same instruction, `change the spec`.";
-    }
-    if detail.contains("CANNOT/UNCLEAR") {
-        return "the lane could not tell what was being asked. Review tab (←), say it again\nmore concretely — name the file and the change.";
-    }
-    match why {
-        "cancelled" => "you cancelled it — press r to run it again from the top",
-        "vacuous_baseline" => {
-            "your suite was already failing before guvnor touched anything.\nFix the tree first: guvnor needs a green baseline to prove red."
-        }
-        "vacuous_tests" => {
-            "the new tests passed with no implementation, so they test nothing.\nSharpen the acceptance criteria on the Spec tab (i to iterate), then r."
-        }
-        "tests_lane_noop" | "impl_lane_noop" => {
-            "the lane talked instead of editing — read its own words above.\nIf it refused, the spec asked for something it won't do: iterate on the\nSpec tab (i). Otherwise r runs it again."
-        }
-        "fix_lane_noop" => {
-            "the fix lane edited nothing — read its own words above.\nIf it refused, your instruction and the spec disagree, or it needs a change\nit is fenced out of (tests, guvnor's own files). Go to the Review tab (←)\nand send a different instruction, or iterate the spec instead."
-        }
-        "impl_does_not_satisfy_tests" => {
-            "the implementation could not pass the tests within the rework budget.\nRead the failing output above: if the tests are wrong the spec is wrong —\niterate it (Spec tab, i). If they're right, r to try again."
-        }
-        // "ask for a narrower change" was the old advice and it was wrong: the
-        // fix is usually already minimal. What actually happened is that a
-        // finding contradicts a test — and the fix lane never sees the tests, so
-        // only you can tell it that.
-        "fix_broke_tests" => {
-            "a finding you ticked cannot be true while a test passes. The fix lane never\nsees the tests, so it could not know — the failing one is named above, and\nyour implementation is still the one on disk.\n  · Review tab (←): put what you just read in the instruction box. That is the\n    only channel that reaches the lane, and it is usually enough.\n  · Or untick that finding: if a test depends on what the reviewer called\n    unnecessary, the reviewer was wrong and the code is right.\n  · If the test itself is wrong, that is `change the spec` — the lane may never\n    edit tests."
-        }
-        "impl_touched_test_files" | "tests_forbidden_paths" | "impl_forbidden_paths" => {
-            "the two lanes fought over the same files. This is a spec problem:\nits Files list should name implementation files only. Iterate it (Spec tab, i)."
-        }
-        "review_unparseable" => "the reviewer didn't return valid JSON — press r to run it again",
-        w if w.ends_with("_timeout") => {
-            "the lane ran out of time. Raise limits.lane_timeout_secs in guvnor.toml\n(c on the runs list), or cut the spec down, then r."
-        }
-        _ => "read the evidence above, then iterate the spec (Spec tab, i) and r to re-run",
-    }
-}
-
 impl CaseView {
     /// Where the current tab sits in the strip. `tab` is an index into `TABS`,
     /// which is not the same thing once a tab in the middle is missing.
@@ -221,8 +134,8 @@ impl CaseView {
     }
 
     /// Move `d` places along the strip, wrapping, skipping the tabs that are
-    /// only drawn. A greyed tab you can land on is the bug this screen was
-    /// reported for: something that looks like a control and answers to nothing.
+    /// only drawn. A greyed tab must never be a destination: it looks like a
+    /// control and answers to nothing.
     pub fn step(&mut self, d: isize) {
         let n = self.shown.len() as isize;
         let mut i = self.tab_pos() as isize;
@@ -239,10 +152,7 @@ impl CaseView {
     }
 }
 
-/// The one thing to do next, in a sentence, naming the key that does it. The
-/// spec screen said this only while the spec was unapproved: approve it and the
-/// screen's only instruction vanished, leaving a 4-second toast as the sole
-/// hint that `r` was the next move.
+/// The one thing to do next, in a sentence, naming the key that does it.
 pub fn next_step(
     g: &state::Gates,
     status: &Status,
@@ -333,14 +243,13 @@ impl App {
         );
 
         let status = Line::from(vec![status_badge(&st.status.to_string()), Span::raw(" ")]);
+        // One hash of spec.json, checked against both pins below.
+        let sha = spec_sha(&dir);
         // The patches on disk were derived from a spec that has since been
         // revised: their content is still evidence, but it describes the old
         // feature. `replan` already dropped the approvals; this is what tells
         // you why the ✓ went away.
-        let superseded = !st.spec_sha_at_run.is_empty()
-            && std::fs::read(dir.join("spec.json"))
-                .map(|b| digest::sha256_hex(&b) != st.spec_sha_at_run)
-                .unwrap_or(false);
+        let superseded = spec_drifted(sha.as_deref(), &st.spec_sha_at_run);
         let fail_tab = build_fail_tab(&dir, &st);
         let gates_done =
             st.gates.spec.approved && st.gates.tests.approved && st.gates.work.approved;
@@ -382,10 +291,8 @@ impl App {
             live.push(FAIL_TAB);
             shown.push(FAIL_TAB);
         }
-        let spec_edited = st.gates.spec.approved
-            && std::fs::read(dir.join("spec.json"))
-                .map(|b| digest::sha256_hex(&b) != st.gates.spec.sha256)
-                .unwrap_or(false);
+        let spec_edited =
+            st.gates.spec.approved && spec_drifted(sha.as_deref(), &st.gates.spec.sha256);
         let next =
             next_step(&st.gates, &st.status, spec_edited, superseded, has("tests.patch"));
         let info = vec![Span::styled(st.title.clone(), Style::new().bold())];
@@ -424,9 +331,8 @@ impl App {
             Constraint::Length(if has_note { 3 } else { 0 }),
         ])
         .areas(area);
-        // tabs box · run info. Approval lives on the tab as a ✓ — no separate
-        // gate-chip box to cross-reference. The Review tab shows the verdict
-        // instead: there is nothing to approve there.
+        // tabs box · run info. Approval lives on the tab as a ✓. The Review tab
+        // shows the verdict instead: there is nothing to approve there.
         let labels: Vec<Line> = v
             .shown
             .iter()
@@ -459,7 +365,7 @@ impl App {
                 .block(boxed("", Style::new())),
             tabs_a,
         );
-        // One row, three things (owner): the run's name from the left, the status
+        // One row, three things: the run's name from the left, the status
         // hard right so it never moves when the title does, and what to do next
         // in the gap between them. Two passes plus a sub-rect is cheaper than a
         // layout split and lets the message wrap into the spare row below rather
@@ -635,90 +541,6 @@ impl App {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_failure_becomes_a_tab_with_a_way_forward() {
-        let dir = std::env::temp_dir().join(format!("guvnor-failtab-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut st = State::new("20260101T000000-x", "t");
-        let ev = |lines: &[&str]| std::fs::write(dir.join("events.ndjson"), lines.join("\n")).unwrap();
-
-        // no failure recorded: no tab
-        ev(&[r#"{"event":"baseline","data":{}}"#]);
-        assert!(build_fail_tab(&dir, &st).is_none());
-
-        ev(&[
-            r#"{"event":"baseline","data":{}}"#,
-            r#"{"event":"run_failed","data":{"why":"fix_lane_noop","detail":"no edits reached the tree\nwhat the lane said:\nI cannot remove the tests."}}"#,
-        ]);
-        st.status = Status::Failed("fix_lane_noop".into());
-        st.save(&dir).unwrap();
-        let lines = build_fail_tab(&dir, &st).unwrap();
-        let text: String = lines
-            .iter()
-            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains("fix_lane_noop"));
-        assert!(text.contains("I cannot remove the tests."), "the lane's own words: {text}");
-        assert!(text.contains("what to do"), "a machine reason alone is a dead end");
-        assert!(text.contains("Review tab"), "must name the key that fixes it");
-        // every why code gets real advice, never the same sentence twice over
-        for why in ["cancelled", "vacuous_tests", "fix_broke_tests", "review_timeout"] {
-            assert_ne!(failure_advice(why, ""), failure_advice("something_new", ""), "{why}");
-        }
-        // a coded refusal overrides the failure class and names the button
-        assert!(failure_advice("fix_lane_noop", "CANNOT/SPEC: needs LICENSE").contains("change the spec"));
-        assert!(failure_advice("fix_lane_noop", "CANNOT/FENCED: tests").contains("change the spec"));
-
-        // A fix that broke the suite used to be told to "ask for a narrower
-        // change" — the fix was already narrow. What happened is that a ticked
-        // finding contradicts a test, and the instruction box is the only
-        // channel that reaches a lane which cannot see tests.
-        let broke = failure_advice("fix_broke_tests", "");
-        assert!(broke.contains("instruction box"), "{broke}");
-        assert!(broke.contains("untick"), "{broke}");
-        assert!(!broke.contains("narrower"), "the old advice misdiagnosed it: {broke}");
-
-        // ...and the findings it was told to fix are half that evidence, so the
-        // tab carries them: the Review tab's ticks are cleared by now
-        ev(&[
-            r#"{"event":"fix_started","data":{"findings":1,"note":"","ticked":[{"file":"src/numeric.js","note":"drop the + 0"}]}}"#,
-            r#"{"event":"run_failed","data":{"why":"fix_broke_tests","detail":"✖ sqrt(-0) returns 0"}}"#,
-        ]);
-        st.status = Status::Failed("fix_broke_tests".into());
-        st.save(&dir).unwrap();
-        let text: String = build_fail_tab(&dir, &st)
-            .unwrap()
-            .iter()
-            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains("src/numeric.js — drop the + 0"), "{text}");
-        assert!(text.contains("told to fix"), "{text}");
-
-        // rejecting a gate is a decision, not a failure
-        ev(&[r#"{"event":"run_failed","data":{"why":"rejected_work","detail":"nope"}}"#]);
-        st.status = Status::Failed("rejected_work".into());
-        assert!(build_fail_tab(&dir, &st).is_none());
-
-        // fixed: the log still holds the failure forever, but the tab is gone —
-        // advice about an error that no longer exists is worse than no tab
-        ev(&[r#"{"event":"run_failed","data":{"why":"cancelled","detail":"d"}}"#]);
-        st.status = Status::Reviewed;
-        st.save(&dir).unwrap();
-        assert!(build_fail_tab(&dir, &st).is_none(), "a fixed failure must stop showing");
-        assert!(active_failure(&dir, &st).is_none());
-        // ...and it comes back if the next attempt breaks again
-        st.status = Status::Failed("cancelled".into());
-        assert!(build_fail_tab(&dir, &st).is_some());
-        // a status with nothing logged still earns a tab: the run is broken
-        ev(&[r#"{"event":"baseline","data":{}}"#]);
-        st.status = Status::Failed("impl_lane_timeout".into());
-        assert!(build_fail_tab(&dir, &st).is_some(), "broken with no detail is still broken");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
     /// The hole: an approval has to die with the thing it approved. `replan`
     /// resets the tests/work gates (engine side); this is the half that tells
     /// you why, so a diff from a superseded spec can't be read as current.
@@ -728,12 +550,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("spec.json"), b"SPEC-V1").unwrap();
-        let stale = |st: &State| {
-            !st.spec_sha_at_run.is_empty()
-                && std::fs::read(dir.join("spec.json"))
-                    .map(|b| digest::sha256_hex(&b) != st.spec_sha_at_run)
-                    .unwrap_or(false)
-        };
+        let stale = |st: &State| spec_drifted(spec_sha(&dir).as_deref(), &st.spec_sha_at_run);
 
         let mut st = State::new("20260101T000000-x", "t");
         assert!(!stale(&st), "nothing run yet is not stale");
@@ -801,11 +618,7 @@ mod tests {
         // it says what it costs, and the safe answer is the preselected one
         let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
         t.draw(|f| app.render_case(f, Rect::new(0, 0, 80, 24))).unwrap();
-        let screen: String = {
-            let buf = t.backend().buffer();
-            (0..24).flat_map(|y| (0..80).map(move |x| (x, y)))
-                .map(|(x, y)| buf[(x, y)].symbol().to_string()).collect()
-        };
+        let screen = screen_text(t.backend().buffer());
         assert!(screen.contains("are replaced"), "the ask says what it costs: {screen:?}");
         // ↵ on the preselected button cancels; the run does not start
         assert!(app.handle_key(&press(KeyCode::Enter)).is_none());
@@ -821,7 +634,7 @@ mod tests {
         assert!(!asking(&app), "and the modal closes behind it");
     }
 
-    /// Landing is the stage box at the foot of the Review tab now — `s` from any
+    /// Landing is the stage box at the foot of the Review tab — `s` from any
     /// tab jumps there and focuses it, and the box renders (a full file list +
     /// buttons) without panicking, roomy or cramped.
     #[test]
@@ -855,23 +668,18 @@ mod tests {
         }
         let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
         t.draw(|f| app.render_case(f, Rect::new(0, 0, 100, 30))).unwrap();
-        let screen: String = {
-            let buf = t.backend().buffer();
-            (0..30).flat_map(|y| (0..100).map(move |x| (x, y)))
-                .map(|(x, y)| buf[(x, y)].symbol().to_string()).collect()
-        };
+        let screen = screen_text(t.backend().buffer());
         assert!(screen.contains("stage —"), "the box titles itself: {screen:?}");
         assert!(screen.contains("stage"), "and offers the stage action: {screen:?}");
     }
 
     /// The strip draws the whole journey, and stepping must visit only the parts
-    /// of it that have happened — a greyed tab you can land on is the bug this
-    /// screen was reported for: something that looks like a control and answers
-    /// to nothing.
+    /// of it that have happened — a greyed tab must never be a destination: it
+    /// looks like a control and answers to nothing.
     #[test]
     fn stepping_the_strip_only_visits_live_tabs() {
-        // failed AND fully approved: Failure is the only conditional tab now
-        // (landing left the strip — it is the `s` box on the Review tab)
+        // failed AND fully approved: Failure is the only conditional tab
+        // (landing is the `s` box on the Review tab, not a tab)
         let all = vec![0, 1, 2, REVIEW_TAB, FAIL_TAB];
         let mut v = view(all.clone(), all);
         // forward through every tab and round to the start
@@ -907,10 +715,8 @@ mod tests {
         assert_eq!(v.tab_pos(), 1);
     }
 
-    /// The reported bug: the pre-run screen showed a strip that looked like tabs
-    /// and answered to nothing. The strip is real now, so what it draws has to
-    /// say which parts of it are reachable — a dim label is a promise, a bright
-    /// one is a control.
+    /// The strip draws the whole journey, so it must say which parts of it are
+    /// reachable — a dim label is a promise, a bright one is a control.
     #[test]
     fn the_strip_draws_the_whole_journey_and_greys_what_has_not_happened() {
         use ratatui::backend::TestBackend;
@@ -931,7 +737,7 @@ mod tests {
         // Failure is not a stage of the journey, so it is not promised; landing
         // is the `s` box on the Review tab, not a tab of its own
         assert!(!row.contains("Failure"), "a run that hasn't failed must not offer it");
-        assert!(!row.contains("Stage"), "landing left the strip — it is the s box on Review");
+        assert!(!row.contains("Stage"), "landing is the s box on Review, not a tab");
         // by cell, not by byte: the row is mostly multi-byte glyphs
         let fg_at = |needle: &str| {
             let x = (0..w).find(|&x| cells[x as usize..].concat().starts_with(needle)).unwrap();
@@ -942,7 +748,7 @@ mod tests {
         assert_ne!(fg_at("Spec"), Some(Color::DarkGray), "the tab you are on is not greyed");
     }
 
-    /// Owner: the status goes hard right, the run's name stays left, and the
+    /// The status goes hard right, the run's name stays left, and the
     /// message sits in the gap between them. A chip whose position depends on
     /// the length of the title is a chip you have to hunt for.
     #[test]
@@ -974,12 +780,11 @@ mod tests {
         assert!(x_of("every gate is green") < x_of("reviewed"), "{}", cells.concat());
     }
 
-    /// 1a: after approving, the spec screen's only instruction disappeared and
-    /// what replaced it was a 4-second toast. Whatever state a run is in, the
-    /// screen says the next move and names the key.
+    /// Whatever state a run is in, the screen says the next move and names the
+    /// key.
     #[test]
     fn the_next_move_is_always_on_screen() {
-        let text = |l: &Line| -> String { l.spans.iter().map(|s| s.content.to_string()).collect() };
+        let text = line_text;
         let key = |l: &Line| l.spans[1].content.to_string();
         let gates = |s, t, w| {
             let mut g = state::Gates::default();
@@ -990,7 +795,7 @@ mod tests {
         };
         let go = state::Status::SpecApproved;
 
-        // unapproved: approving is the only move, and it is ↵ (not the old `a`)
+        // unapproved: approving is the only move, and it is ↵
         let l = next_step(&gates(false, false, false), &go, false, false, false);
         assert_eq!(key(&l), "↵");
         assert!(text(&l).contains("approve"), "{}", text(&l));

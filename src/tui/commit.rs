@@ -83,9 +83,7 @@ impl StageView {
         }
     }
 
-    /// What is about to happen, in words. The old one-liner
-    /// (`into your working tree, uncommitted · look, then commit`) was shorthand
-    /// for a two-step process nobody had been told about yet.
+    /// What is about to happen, in words.
     pub fn explain(&self) -> Vec<Line<'static>> {
         let dim = Style::new().fg(Color::DarkGray);
         let mut out = if self.done {
@@ -234,16 +232,16 @@ pub fn commit_key(app: &mut App, key: &KeyEvent) -> Option<Go> {
                 v.with_body = !v.with_body;
                 return None;
             }
+            // 0 generate · 1 copy · 2 commit — the index is the contract, the
+            // labels are display only
             let i = v.buttons.handle(key.code)?;
-            let label = v.buttons.labels.get(i).copied().unwrap_or("");
-            if label == "generate" {
-                let id = v.id.clone();
+            if i == 0 {
                 v.drafting = true;
-                return Some(Go::Draft(id));
+                return Some(Go::Draft(v.id.clone()));
             }
             // read out of the view before the arm that needs `app` itself
             let (subject, body) = v.parts();
-            if label == "commit" {
+            if i == 2 {
                 return commit_now(app);
             }
             let full = if body.is_empty() { subject } else { format!("{subject}\n\n{body}") };
@@ -386,7 +384,7 @@ impl App {
             // Subject in bold, and red the moment it stops fitting. Wrapped by
             // `wrap_line` rather than `Paragraph`, so the styling follows the
             // logical line across its rows and the cursor below lands on its
-            // own glyph — the two now agree because they share the break rule.
+            // own glyph — the two agree because they share the break rule.
             let w = minner.width as usize;
             let mut text: Vec<Line> = Vec::new();
             for (i, l) in v.msg.lines.iter().enumerate() {
@@ -430,8 +428,7 @@ impl App {
 
     /// Rebuild the run screen after staging or unstaging and land on the Review
     /// tab with the stage box focused, so the new state (and its new buttons)
-    /// shows without a second keypress — the parallel to the old tab redrawing
-    /// itself in place.
+    /// shows without a second keypress.
     pub fn reopen_stage(&mut self, id: &str) {
         match self.build_case(id) {
             Ok(mut v) => {
@@ -528,16 +525,16 @@ mod tests {
         assert_eq!(v.buttons.labels[v.buttons.sel], "copy");
     }
 
-    /// The Stage tab offers exactly the moves the tree is in a state for, and
+    /// The stage box offers exactly the moves the tree is in a state for, and
     /// nothing else — a button for something impossible is worse than no button.
     #[test]
-    fn the_stage_tab_offers_only_what_the_tree_allows() {
+    fn the_stage_box_offers_only_what_the_tree_allows() {
         let labels = |st: Status| StageView::build("nope", &st, None).buttons.labels.to_vec();
         assert_eq!(labels(Status::Reviewed), ["stage"], "not in the tree yet");
         assert_eq!(labels(Status::Staged), ["commit", "unstage"], "in the tree: keep it or not");
         assert!(labels(Status::Committed).is_empty(), "committed: nothing left to do");
-        // ...and an empty row cannot fire anything: `handle` answers, `labels`
-        // has nothing at that index, so the dispatch finds no arm
+        // ...and committed builds an empty row: `handle` answers, but there is
+        // no label at any index and the dispatch guards on the same state
         let mut none = StageView::build("nope", &Status::Committed, None).buttons;
         assert_eq!(none.labels.get(none.handle(KeyCode::Enter).unwrap_or(0)), None);
     }
@@ -545,14 +542,8 @@ mod tests {
     /// The words under the file list are the whole explanation of why landing is
     /// two steps, so each state has to say something different and true.
     #[test]
-    fn the_stage_tab_explains_itself_in_each_state() {
-        let text = |v: &StageView| {
-            v.explain()
-                .iter()
-                .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
-                .collect::<Vec<_>>()
-                .join(" ")
-        };
+    fn the_stage_box_explains_itself_in_each_state() {
+        let text = |v: &StageView| lines_text(&v.explain());
         let words = |st: Status| text(&StageView::build("nope", &st, None));
         assert!(words(Status::Reviewed).contains("Staging writes these files"));
         assert!(words(Status::Reviewed).contains("Nothing is committed until you ask"));

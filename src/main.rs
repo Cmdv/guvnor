@@ -3,6 +3,7 @@ mod config;
 mod digest;
 mod engine;
 mod events;
+mod git;
 mod harness;
 mod hookguard;
 mod lane;
@@ -31,8 +32,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Scaffold .guvnor/guvnor.toml in the current repo
-    Init,
     /// Draft a five-part spec with the planner lane (then edit + approve it)
     Plan {
         title: String,
@@ -119,7 +118,6 @@ fn run(cli: Cli) -> Result<i32> {
             HookCmd::Read => hookguard::run_read_guard(),
             HookCmd::Bash => hookguard::run_bash_guard(),
         },
-        Cmd::Init => cmd_init(),
         Cmd::Plan { title, context } => run_op(verbose, move |tx| engine::plan(&title, &context, tx)),
         Cmd::Run { id } => run_op(verbose, move |tx| engine::run(&id, tx)),
         Cmd::Review { id } => {
@@ -153,7 +151,7 @@ fn run(cli: Cli) -> Result<i32> {
 }
 
 /// Run a long engine op on a background thread, printing its Progress events
-/// as they arrive — the same wiring the TUI will use with a render loop.
+/// as they arrive — the same wiring the TUI uses with a render loop.
 fn run_op<F>(verbose: bool, op: F) -> Result<i32>
 where
     F: FnOnce(&Sender<Progress>) -> Result<i32> + Send + 'static,
@@ -181,16 +179,4 @@ fn print_progress(p: &Progress, verbose: bool) {
         Progress::Done(m) => println!("{m}"),
         Progress::Failed { why, detail } => eprintln!("guvnor: run failed [{why}]: {detail}"),
     }
-}
-
-fn cmd_init() -> Result<i32> {
-    let dir = std::env::current_dir()?;
-    let existed = dir.join(".guvnor/guvnor.toml").exists();
-    let cfg = config::init_repo(&dir)?;
-    if existed {
-        println!("already initialized: {}", cfg.display());
-    } else {
-        println!("wrote {} — edit commands.test and paths, then `guvnor plan \"...\"`", cfg.display());
-    }
-    Ok(0)
 }

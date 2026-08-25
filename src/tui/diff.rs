@@ -29,6 +29,9 @@ pub struct DiffView {
     /// Rows the last frame had room for, so `handle` can scroll only when the
     /// cursor would otherwise leave the screen (the trick `Scroll::max` uses).
     view_h: Cell<u16>,
+    /// Width the last frame wrapped body lines to, so `head_y` can reproduce
+    /// the same wrapped row count `render_diff` actually drew.
+    body_w: Cell<u16>,
 }
 
 impl DiffView {
@@ -56,8 +59,9 @@ impl DiffView {
     /// body (and its trailing blank) of any of them that is open.
     fn head_y(&self, i: usize) -> u16 {
         let mut y = 1; // the box's blank lead line
+        let w = self.body_w.get().max(1) as usize;
         for s in self.sections.iter().take(i) {
-            y += 1 + if s.open { s.body.len() as u16 + 1 } else { 0 };
+            y += 1 + if s.open { hang_wrap_all(&s.body, w).len() as u16 + 1 } else { 0 };
         }
         y
     }
@@ -116,26 +120,39 @@ fn head_line(path: &str, kind: &str, plus: usize, minus: usize) -> Line<'static>
 
 /// Split a git patch into one section per file, dropping the plumbing.
 pub fn patch_sections(patch: &str) -> Vec<Section> {
-    // path, kind, hunk lines, + count, - count
-    let mut files: Vec<(String, &'static str, Vec<Line<'static>>, usize, usize)> = Vec::new();
+    // one file's worth of patch, while the split is in flight
+    struct FileDiff {
+        path: String,
+        kind: &'static str,
+        hunks: Vec<Line<'static>>,
+        adds: usize,
+        dels: usize,
+    }
+    let mut files: Vec<FileDiff> = Vec::new();
     for l in patch.lines() {
         if let Some(rest) = l.strip_prefix("diff --git ") {
-            // `a/path b/path`; the b side is the file as it will exist.
-            // ponytail: a path containing " b/" would split wrong — git quotes
-            // the odd ones, and the header is cosmetic either way.
+            // `a/path b/path`; a placeholder good enough for a binary diff
+            // (no `---`/`+++` pair follows those), overwritten below for the
+            // common case where one does.
             let path = rest.rsplit(" b/").next().unwrap_or(rest).to_string();
-            files.push((path, "modified", Vec::new(), 0, 0));
+            files.push(FileDiff { path, kind: "modified", hunks: Vec::new(), adds: 0, dels: 0 });
             continue;
         }
         // Anything before the first `diff --git` is git's own preamble.
         let Some(f) = files.last_mut() else { continue };
         if l.starts_with("new file") {
-            f.1 = "new";
+            f.kind = "new";
             continue;
         }
         if l.starts_with("deleted file") {
-            f.1 = "deleted";
+            f.kind = "deleted";
             continue;
+        }
+        // The authoritative path: each of these is a fixed prefix then the
+        // path to end of line, so nothing in the path (a space, or literally
+        // " b/") can be mistaken for the header's own syntax.
+        if let Some(p) = l.strip_prefix("--- a/").or_else(|| l.strip_prefix("+++ b/")) {
+            f.path = p.to_string();
         }
         // index / mode / rename headers and the ---,+++ pair: the row says all
         // of it (or it doesn't matter), and every one of them is a line the
@@ -153,22 +170,22 @@ pub fn patch_sections(patch: &str) -> Vec<Section> {
         let style = match l.chars().next() {
             Some('@') => Style::new().fg(Color::Cyan),
             Some('+') => {
-                f.3 += 1;
+                f.adds += 1;
                 Style::new().fg(Color::Green)
             }
             Some('-') => {
-                f.4 += 1;
+                f.dels += 1;
                 Style::new().fg(Color::Red)
             }
             _ => Style::new().fg(Color::Gray),
         };
-        f.2.push(Line::styled(format!("   {l}"), style));
+        f.hunks.push(Line::styled(format!("   {l}"), style));
     }
     files
         .into_iter()
-        .map(|(path, kind, body, plus, minus)| Section {
-            head: head_line(&path, kind, plus, minus),
-            body,
+        .map(|f| Section {
+            head: head_line(&f.path, f.kind, f.adds, f.dels),
+            body: f.hunks,
             open: false,
         })
         .collect()
@@ -176,6 +193,7 @@ pub fn patch_sections(patch: &str) -> Vec<Section> {
 
 pub fn render_diff(f: &mut Frame, area: Rect, v: &DiffView) {
     v.view_h.set(area.height);
+    v.body_w.set(area.width);
     let mut lines: Vec<Line> = vec![Line::raw("")];
     for (i, s) in v.sections.iter().enumerate() {
         let sel = i == v.sel;
@@ -197,12 +215,14 @@ pub fn render_diff(f: &mut Frame, area: Rect, v: &DiffView) {
         }
         lines.push(head);
         if s.open {
-            lines.extend(s.body.iter().cloned());
+            lines.extend(hang_wrap_all(&s.body, area.width as usize));
             lines.push(Line::raw(""));
         }
     }
-    // ponytail: no wrap — a long code line is truncated, not reflowed, so the
-    // drawn line count matches `head_y` exactly and the cursor can't drift.
+    // Body lines wrap to the box width (`hang_wrap_all`), so a long code line
+    // continues on the next row instead of running off the edge; `head_y`
+    // wraps to the same width it last saw (`body_w`), so the drawn line count
+    // and the cursor's row never disagree.
     let total = lines.len();
     let off = v.scroll.fit(total, area.height);
     f.render_widget(Paragraph::new(lines).scroll((off, 0)), area);
@@ -231,19 +251,15 @@ index 0000000..1111111
 +two
 ";
 
-    fn text(l: &Line) -> String {
-        l.spans.iter().map(|s| s.content.as_ref()).collect()
-    }
-
     /// One row per file, the plumbing gone, and the counts taken from the hunks
     /// rather than from anything the model said.
     #[test]
     fn a_patch_becomes_one_row_per_file() {
         let s = patch_sections(PATCH);
         assert_eq!(s.len(), 2, "one section per file");
-        assert_eq!(text(&s[0].head), "modified src/a.js  +1 -1");
-        assert_eq!(text(&s[1].head), "new      test/b.test.js  +2 -0");
-        let body: String = s.iter().flat_map(|f| f.body.iter()).map(text).collect();
+        assert_eq!(line_text(&s[0].head), "modified src/a.js  +1 -1");
+        assert_eq!(line_text(&s[1].head), "new      test/b.test.js  +2 -0");
+        let body: String = s.iter().flat_map(|f| f.body.iter()).map(line_text).collect();
         for noise in ["index ", "--- ", "+++ ", "diff --git"] {
             assert!(!body.contains(noise), "{noise:?} survived into the body: {body:?}");
         }
@@ -262,11 +278,7 @@ index 0000000..1111111
         let draw = |v: &DiffView| -> String {
             let mut t = Terminal::new(TestBackend::new(60, 12)).unwrap();
             t.draw(|f| render_diff(f, Rect::new(0, 0, 60, 12), v)).unwrap();
-            let buf = t.backend().buffer().clone();
-            (0..12)
-                .map(|y| (0..60).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
-                .collect::<Vec<_>>()
-                .join("\n")
+            screen_text(t.backend().buffer())
         };
         let closed = draw(&v);
         assert!(closed.contains("▸ modified src/a.js"), "{closed}");
@@ -287,6 +299,10 @@ index 0000000..1111111
             sections: patch_sections(PATCH),
             ..Default::default()
         };
+        // Built directly (no render_diff pass), so body_w defaults to 0; set
+        // it wide enough that this fixture's body lines don't actually wrap,
+        // so head_y still counts one row per body line below.
+        v.body_w.set(200);
         assert_eq!(v.head_y(0), 1);
         assert_eq!(v.head_y(1), 2, "collapsed rows are one line each");
         assert!(v.handle(&press(KeyCode::Char(' '))));

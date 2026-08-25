@@ -50,8 +50,8 @@ impl Gates {
     }
 }
 
-/// Run lifecycle status. Serialized as a flat string (backward-compatible with
-/// existing run dirs): the progress states plus `failed:<why>` for any terminal
+/// Run lifecycle status. Serialized as a flat string, so state.json stays
+/// greppable: the progress states plus `failed:<why>` for any terminal
 /// failure, where `<why>` is a machine reason like `vacuous_baseline`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "String", into = "String")]
@@ -93,10 +93,6 @@ impl From<String> for Status {
             "reviewed" => Status::Reviewed,
             "staged" => Status::Staged,
             "committed" => Status::Committed,
-            // Runs from before staging and committing were told apart. They
-            // were staged and never committed by guvnor, so that is what they
-            // were: keep reading them rather than calling them failures.
-            "merged" => Status::Staged,
             other => Status::Failed(other.strip_prefix("failed:").unwrap_or(other).to_string()),
         }
     }
@@ -205,13 +201,13 @@ pub fn resolve_run_dir(repo: &Path, id_prefix: &str) -> Result<PathBuf> {
 }
 
 pub fn slugify(title: &str, max: usize) -> String {
-    let mut s: String = title
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    while s.contains("--") {
-        s = s.replace("--", "-");
+    let mut s = String::new();
+    for c in title.to_lowercase().chars() {
+        let c = if c.is_ascii_alphanumeric() { c } else { '-' };
+        // collapse runs: skip a '-' when the output already ends with one
+        if c != '-' || !s.ends_with('-') {
+            s.push(c);
+        }
     }
     s.truncate(max);
     s.trim_matches('-').to_string()
@@ -248,10 +244,6 @@ mod tests {
             assert_eq!(serde_json::to_string(&s).unwrap(), json, "serialize {s:?}");
             assert_eq!(serde_json::from_str::<Status>(json).unwrap(), s, "deserialize {json}");
         }
-        // Run dirs written before staging and committing were told apart: they
-        // were staged, never committed, so they must keep reading as staged
-        // rather than degrading into `Failed("merged")`.
-        assert_eq!(serde_json::from_str::<Status>("\"merged\"").unwrap(), Status::Staged);
     }
 
     #[test]

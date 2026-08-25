@@ -2,8 +2,8 @@ use crate::spec::extract_json_object;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// The reviewer's decision — a closed set the type now enforces (serde rejects
-/// anything else at parse time, so no hand-rolled string validation).
+/// The reviewer's decision — a closed set; serde rejects anything else at
+/// parse time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Decision {
@@ -15,8 +15,8 @@ pub enum Decision {
 impl std::fmt::Display for Decision {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         // `pad`, not `write_str`: `write_str` bypasses the formatter and silently
-        // ignores width, so `{:<7}` on one of these produced `lowsrc/numeric.js`
-        // in the findings list.
+        // ignores width, so `{:<7}` on one of these would produce
+        // `lowsrc/numeric.js` in the findings list.
         f.pad(match self {
             Decision::Approved => "APPROVED",
             Decision::Warning => "WARNING",
@@ -66,9 +66,8 @@ pub struct Verdict {
 }
 
 /// Stored review: model verdict + OUR digest of the diff it judged.
-/// Merge refuses when the digest no longer matches the patches on disk —
-/// a stale verdict can never ship a newer diff (Foreman's admitted gate
-/// hole, fixed by construction here).
+/// Stage and commit refuse when the digest no longer matches the patches on
+/// disk — a stale verdict can never ship a newer diff.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Review {
     #[serde(flatten)]
@@ -81,7 +80,6 @@ pub struct Review {
 pub fn parse_verdict(result_text: &str) -> Result<Verdict> {
     let json = extract_json_object(result_text)
         .context("reviewer output contains no JSON object")?;
-    // serde enforces the APPROVED|WARNING|BLOCKED set via the Decision enum.
     serde_json::from_str(json).context("verdict JSON invalid (need APPROVED|WARNING|BLOCKED)")
 }
 

@@ -157,7 +157,7 @@ pub fn spin_frame() -> &'static str {
     SPIN[(ms / 100) as usize % SPIN.len()]
 }
 
-pub fn gate_chip(label: &str, ok: bool) -> Span<'static> {
+fn gate_chip(label: &str, ok: bool) -> Span<'static> {
     if ok {
         Span::styled(format!(" {label} ✓ "), Style::new().bg(Color::Green).fg(Color::Black).bold())
     } else {
@@ -179,9 +179,7 @@ pub fn gates_line(g: &crate::state::Gates) -> Line<'static> {
 }
 
 /// The run's state as a filled chip, in words instead of the machine string.
-/// Plain text beside a bold title is where a status goes to hide, and the old
-/// version only coloured `merged` — a string Phase 2j retired, so every landed
-/// run rendered as undifferentiated white.
+/// Plain text beside a bold title is where a status goes to hide.
 ///
 /// Four colours, four meanings: grey = still working, cyan = your move,
 /// green = landed, yellow = you said no, red = broken.
@@ -304,7 +302,7 @@ mod tests {
         assert!(line.spans.iter().any(|s| s.content == " └" && s.style.fg.is_none()));
     }
 
-    /// The proof the focus fix rests on: a box's hanging brackets take its
+    /// The invariant focus styling rests on: a box's hanging brackets take its
     /// `title_style`, so lighting the border white lights the brackets with it.
     #[test]
     fn title_style_colours_the_hanging_brackets() {

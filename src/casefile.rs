@@ -156,11 +156,10 @@ pub fn cost_rows(run_dir: &Path) -> Vec<CostRow> {
             d["cost_usd"].as_f64().unwrap_or(0.0),
         );
         if i == 0 && o == 0 {
-            continue; // runs recorded before metrics existed
+            continue; // no usage data: nothing to put in the ledger
         }
         let n = *seen.entry(event.clone()).and_modify(|n| *n += 1).or_insert(1);
-        // Pre-rework runs have no `round`, so they read as round 0 and keep
-        // their old names.
+        // a missing `round` reads as 0
         let round = d["round"].as_u64().unwrap_or(0);
         if event == "lane_impl_fix" && round == 0 {
             fix_n += 1;
@@ -198,14 +197,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cost_summary_sums_lane_events_and_skips_old_ones() {
+    fn cost_summary_sums_lane_events_and_skips_rows_without_usage() {
         let dir = std::env::temp_dir().join(format!("guvnor-cost-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("events.ndjson"),
             concat!(
                 r#"{"ts":"t","event":"lane_planner","data":{"tokens_in":100,"tokens_out":10,"cost_usd":0.01}}"#, "\n",
-                r#"{"ts":"t","event":"lane_tests","data":{"changed":true}}"#, "\n", // pre-metrics event
+                r#"{"ts":"t","event":"lane_tests","data":{"changed":true}}"#, "\n", // event without usage data
                 r#"{"ts":"t","event":"lane_impl","data":{"tokens_in":200,"tokens_out":20,"cost_usd":0.02}}"#, "\n",
                 r#"{"ts":"t","event":"reviewed","data":{"verdict":"APPROVED","tokens_in":50,"tokens_out":5,"cost_usd":0.005}}"#, "\n",
             ),
@@ -213,7 +212,7 @@ mod tests {
         .unwrap();
         let s = cost_summary(&dir).unwrap();
         assert!(s.contains("spec draft"));
-        assert!(!s.contains("test-writer"), "pre-metrics event must be skipped");
+        assert!(!s.contains("test-writer"), "an event without usage data must be skipped");
         assert!(s.contains("350"), "under 1k stays raw: {s}");
         assert!(s.contains("$0.0350"), "total cost summed: {s}");
         std::fs::remove_dir_all(&dir).ok();

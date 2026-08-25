@@ -13,9 +13,9 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// Cooperative cancel for the running lane (TUI `c`). The lane's process
-/// group is killed and the engine records the run as cancelled.
-// ponytail: global flag = one engine job per process; per-job tokens if the
-// TUI ever runs jobs concurrently.
+/// group is killed and the engine records the run as cancelled. A single
+/// flag is correct here: the TUI's `App` holds one `job: Option<Job>`, so
+/// only one lane is ever running in this process at a time.
 static CANCEL: AtomicBool = AtomicBool::new(false);
 
 pub fn request_cancel() {
@@ -95,10 +95,13 @@ fn absorb_result_event(v: &serde_json::Value, out: &mut ReaderOut) {
 /// very binary. The write guard allows anywhere in the worktree except
 /// guvnor's own control surfaces (`hookguard::DENIED`) and `deny` — exact
 /// repo-relative paths an earlier lane's patch already owns, so the two
-/// patches stay composable on the verification tree.
+/// patches stay composable on the verification tree. `deny` itself travels as
+/// a NUL-separated `.claude/deny` file rather than on the hook's command
+/// line: it sits inside a one-line shell command, so a literal comma OR
+/// newline in a path would corrupt it either way, and NUL is the one byte no
+/// POSIX path can ever contain.
 pub fn write_settings(wt: &Path, deny: &[String]) -> Result<()> {
     let exe = std::env::current_exe()?.display().to_string();
-    let deny_csv = deny.join(",");
     let settings = json!({
         "hooks": {
             "PreToolUse": [
@@ -106,7 +109,7 @@ pub fn write_settings(wt: &Path, deny: &[String]) -> Result<()> {
                     "matcher": "Write|Edit|MultiEdit|NotebookEdit",
                     "hooks": [{
                         "type": "command",
-                        "command": format!("GUVNOR_DENY={deny_csv} \"{exe}\" hook write")
+                        "command": format!("\"{exe}\" hook write")
                     }]
                 },
                 {
@@ -126,6 +129,9 @@ pub fn write_settings(wt: &Path, deny: &[String]) -> Result<()> {
     let dir = wt.join(".claude");
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join("settings.json"), serde_json::to_string_pretty(&settings)?)?;
+    if !deny.is_empty() {
+        std::fs::write(dir.join("deny"), deny.join("\0"))?;
+    }
     Ok(())
 }
 
@@ -266,7 +272,7 @@ pub fn tail(text: &str, lines: usize) -> String {
 }
 
 // ---- prompts ----------------------------------------------------------
-// Constraints go FIRST: spike showed hook denials cost retry turns when the
+// Constraints go FIRST: hook denials cost retry turns when the
 // model discovers limits by trial. Hooks stay as backstop.
 
 pub fn planner_prompt(title: &str, context: &str, test_cmd: &str) -> String {
@@ -586,6 +592,29 @@ Prose that runs past a line is unreadable here. Keep every line under 100 chars.
 mod tests {
     use super::*;
 
+    /// A path with a comma broke the old `GUVNOR_DENY=<csv>` command line; a
+    /// NUL-joined file has no such delimiter collision, and the deny list no
+    /// longer appears on the command line at all.
+    #[test]
+    fn write_settings_puts_deny_in_a_nul_joined_file_not_on_the_command_line() {
+        let dir = std::env::temp_dir().join("guvnor-lane-deny-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_settings(&dir, &["test/a, comma.js".into(), "test/b.js".into()]).unwrap();
+        let settings = std::fs::read_to_string(dir.join(".claude/settings.json")).unwrap();
+        assert!(!settings.contains("GUVNOR_DENY"), "deny must not be on the command line");
+        let deny = std::fs::read_to_string(dir.join(".claude/deny")).unwrap();
+        assert_eq!(deny, "test/a, comma.js\0test/b.js");
+    }
+
+    #[test]
+    fn write_settings_skips_the_deny_file_when_nothing_is_denied() {
+        let dir = std::env::temp_dir().join("guvnor-lane-nodeny-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::remove_file(dir.join(".claude/deny")).ok();
+        write_settings(&dir, &[]).unwrap();
+        assert!(!dir.join(".claude/deny").exists());
+    }
+
     #[test]
     fn tail_last_lines() {
         assert_eq!(tail("a\nb\nc", 2), "b\nc");
@@ -680,10 +709,9 @@ mod tests {
         assert!(planner_prompt("t", "ctx", "node --test").contains("file manifest"));
     }
 
-    /// Drive-test defect: the reviewer has no Bash, tried `node --test` anyway,
-    /// and filed "bash was denied so the tests were not actually run" as two low
-    /// findings on the triage screen. It needs the gate's evidence and an
-    /// explicit ban, not a shell.
+    /// The reviewer has no Bash by design; without the green gate's evidence in
+    /// the prompt it files its own denied Bash as findings. It needs the gate's
+    /// evidence and an explicit ban, not a shell.
     #[test]
     fn reviewer_prompt_carries_the_green_evidence_instead_of_a_shell() {
         let r = reviewer_prompt("SPEC", "DIFF", "node --test", "# pass 7\n# fail 0");
@@ -753,9 +781,9 @@ mod tests {
         assert!(h.contains("[high] in src/b.js: guard"));
     }
 
-    /// A fix that broke a test used to be a dead end: the lane cannot see the
-    /// tests, and the engine threw the failure away, so the next attempt made
-    /// the identical edit. The human had to re-type the failure by hand.
+    /// Without the regression context the lane cannot see what broke and makes
+    /// the identical edit again, and the human has to re-type the failure by
+    /// hand.
     #[test]
     fn a_fix_that_broke_a_test_gets_told_which_one() {
         use crate::review::{Finding, Severity};

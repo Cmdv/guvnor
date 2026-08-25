@@ -1,21 +1,22 @@
-use crate::digest::git;
+use crate::git::git;
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
 /// Lane worktrees live under `.guvnor/wt/` — inside the repo dir but kept out
 /// of the tracked tree via `.git/info/exclude` (see `ensure_wt_ignored`), so
-/// nothing is created outside the repo. The old spike worry (a `node --test`
-/// picking up sibling fixtures) doesn't apply: each lane runs tests with cwd =
-/// its OWN worktree, never an ancestor of another, and a worktree checkout has
-/// no nested `wt/` (it's git-excluded, so never in HEAD).
-pub fn wt_container(repo: &Path) -> PathBuf {
+/// nothing is created outside the repo. A test runner in one lane never picks
+/// up sibling fixtures: each lane runs tests with cwd = its OWN worktree,
+/// never an ancestor of another, and a worktree checkout has no nested `wt/`
+/// (it's git-excluded, so never in HEAD).
+fn wt_container(repo: &Path) -> PathBuf {
     repo.join(".guvnor/wt")
 }
 
 /// Exclude the worktree container from git locally. It's per-developer
 /// throwaway state; a *tracked* .gitignore edit would dirty the tree and trip
-/// the merge clean-tree check, so we write `$GIT_DIR/info/exclude` instead
-/// (local, uncommitted). Idempotent — safe to call every run.
+/// the stage clean-tree check, so the exclusion goes in
+/// `$GIT_DIR/info/exclude` instead (local, uncommitted). Idempotent — safe to
+/// call every run.
 pub fn ensure_wt_ignored(repo: &Path) -> Result<()> {
     const ENTRY: &str = ".guvnor/wt/";
     let rel = git(repo, &["rev-parse", "--git-path", "info/exclude"])?;
@@ -67,7 +68,7 @@ pub fn remove(repo: &Path, dir: &Path) -> Result<()> {
 const LANES: [&str; 3] = ["tests", "impl", "verif"];
 
 /// Is `name` a worktree dir belonging to `run_id`?
-pub fn is_run_wt(name: &str, run_id: &str) -> bool {
+fn is_run_wt(name: &str, run_id: &str) -> bool {
     name.strip_prefix(run_id)
         .and_then(|r| r.strip_prefix('-'))
         .is_some_and(|lane| LANES.contains(&lane))
@@ -108,7 +109,7 @@ pub fn apply_patch(wt: &Path, patch: &str) -> Result<()> {
     apply_args(wt, patch, &["apply", "--whitespace=nowarn"])
 }
 
-/// Apply to index+tree in the MAIN repo (the commit step): leaves it staged.
+/// Apply to index+tree in the MAIN repo (the stage step): leaves it staged.
 pub fn apply_patch_staged(repo: &Path, patch: &str) -> Result<()> {
     apply_args(repo, patch, &["apply", "--index", "--whitespace=nowarn"])
 }
@@ -139,28 +140,23 @@ fn apply_args(dir: &Path, patch: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Paths touched by a patch, from `diff --git a/X b/Y` headers.
-/// ponytail: assumes no spaces/quotes in repo paths — fine for v1.
+/// Paths touched by a patch, read from the `---`/`+++` lines: each is a fixed
+/// prefix then the path to end of line, so nothing in the path itself (a
+/// space, or literally " b/") can be mistaken for the header's own syntax the
+/// way splitting the `diff --git` summary line would.
 pub fn patch_paths(patch: &str) -> Vec<String> {
     let mut paths = Vec::new();
     for line in patch.lines() {
-        if let Some(rest) = line.strip_prefix("diff --git a/") {
-            if let Some((a, b)) = rest.split_once(" b/") {
-                for p in [a, b] {
-                    if !p.is_empty() && !paths.contains(&p.to_string()) {
-                        paths.push(p.to_string());
-                    }
-                }
+        let path = line.strip_prefix("--- a/").or_else(|| line.strip_prefix("+++ b/"));
+        if let Some(p) = path {
+            if !paths.iter().any(|x| x == p) {
+                paths.push(p.to_string());
             }
         }
     }
     paths
 }
 
-/// Server-side re-validation of a lane's patch. The hook is the first line of
-/// defence; this is the backstop that doesn't trust the lane's environment at
-/// all. Lanes may touch the whole repo, so all this enforces is: there IS work,
-/// and it stays off guvnor's own control surfaces.
 /// Paths that both patches touch. Applying both to one tree would collide
 /// (`already exists in working directory`), so an overlap must be caught as a
 /// gate failure before `git apply` turns it into a raw error.
@@ -169,6 +165,10 @@ pub fn overlapping_paths(first: &str, second: &str) -> Vec<String> {
     patch_paths(second).into_iter().filter(|p| a.contains(p)).collect()
 }
 
+/// Server-side re-validation of a lane's patch. The hook is the first line of
+/// defence; this is the backstop that doesn't trust the lane's environment at
+/// all. Lanes may touch the whole repo, so all this enforces is: there IS work,
+/// and it stays off guvnor's own control surfaces.
 pub fn validate_patch(patch: &str, label: &str) -> Result<()> {
     let paths = patch_paths(patch);
     if paths.is_empty() {
@@ -207,7 +207,7 @@ mod tests {
         let excl = std::fs::read_to_string(dir.join(".git/info/exclude")).unwrap();
         assert_eq!(excl.matches(".guvnor/wt/").count(), 1);
         // a worktree inside the ignored container leaves the main tree clean
-        // (the property the merge clean-tree check depends on)
+        // (the property the stage clean-tree check depends on)
         let wt = wt_container(&dir).join("probe");
         std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
         git(&dir, &["worktree", "add", "--detach", wt.to_str().unwrap(), "HEAD"]).unwrap();
@@ -232,8 +232,8 @@ mod tests {
 
     #[test]
     fn finds_overlapping_paths() {
-        let tests = "diff --git a/test/A.hs b/test/A.hs\n--- a/x\n+++ b/x\n@@\n+x\n";
-        let impl_clean = "diff --git a/src/B.hs b/src/B.hs\n--- a/x\n+++ b/x\n@@\n+y\n";
+        let tests = "diff --git a/test/A.hs b/test/A.hs\n--- a/test/A.hs\n+++ b/test/A.hs\n@@\n+x\n";
+        let impl_clean = "diff --git a/src/B.hs b/src/B.hs\n--- a/src/B.hs\n+++ b/src/B.hs\n@@\n+y\n";
         assert!(overlapping_paths(tests, impl_clean).is_empty());
         // the real failure: impl re-creates a file tests.patch already owns
         assert_eq!(overlapping_paths(tests, PATCH), vec!["test/A.hs".to_string()]);
@@ -248,7 +248,7 @@ mod tests {
         // guvnor's own control surfaces stay off-limits
         let evil = "diff --git a/.claude/settings.json b/.claude/settings.json\n--- a/.claude/settings.json\n+++ b/.claude/settings.json\n@@\n+{}\n";
         assert!(validate_patch(evil, "impl").is_err());
-        let tamper = "diff --git a/.guvnor/runs/x/state.json b/.guvnor/runs/x/state.json\n--- a/x\n+++ b/x\n@@\n+{}\n";
+        let tamper = "diff --git a/.guvnor/runs/x/state.json b/.guvnor/runs/x/state.json\n--- a/.guvnor/runs/x/state.json\n+++ b/.guvnor/runs/x/state.json\n@@\n+{}\n";
         assert!(validate_patch(tamper, "impl").is_err());
     }
 }

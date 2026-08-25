@@ -47,8 +47,8 @@ pub struct ReviewView {
     /// reviewer raised it again, which is the opposite of resolved.
     pub reraised: Vec<bool>,
     pub resolved: Vec<crate::review::Finding>,
-    /// Your own instruction, sent to the fix lane with the ticked findings.
-    /// ponytail: one line — widen to a TextArea if a sentence stops being enough.
+    /// Your own instruction, sent to the fix lane with the ticked findings —
+    /// one line, like a commit subject: enough for an instruction, not an essay.
     pub note: LineInput,
     /// Cursor: `0..live.len()` findings · then the instruction · then the actions.
     pub sel: usize,
@@ -165,7 +165,6 @@ pub fn review_key(r: &mut ReviewView, key: &KeyEvent) -> Took {
     // still leave. The actions rebuild the run, which needs `App`, so ↵ hands a
     // `Go` back rather than acting here.
     if r.focus == ReviewFocus::Stage {
-        let id = r.id.clone();
         let Some(stage) = r.stage.as_mut() else { return Took::No };
         return match key.code {
             KeyCode::Down | KeyCode::Char('j') => {
@@ -185,14 +184,15 @@ pub fn review_key(r: &mut ReviewView, key: &KeyEvent) -> Took {
                 stage.scroll.by(-5);
                 Took::Yes
             }
-            KeyCode::Enter => {
-                match stage.buttons.labels.get(stage.buttons.sel).copied().unwrap_or("") {
-                    "stage" => Took::Go(Go::Stage(id)),
-                    "unstage" => Took::Go(Go::Unstage(id)),
-                    "commit" => Took::Go(Go::OpenCommit(id)),
-                    _ => Took::Yes,
-                }
-            }
+            // The tree's state names the action at each index — `StageView::build`
+            // laid the buttons out from the same state, so the labels stay
+            // display-only. Committed offers nothing to fire.
+            KeyCode::Enter => match (stage.done, stage.staged, stage.buttons.sel) {
+                (true, ..) => Took::Yes,
+                (_, false, _) => Took::Go(Go::Stage(r.id.clone())),
+                (_, true, 0) => Took::Go(Go::OpenCommit(r.id.clone())),
+                (_, true, _) => Took::Go(Go::Unstage(r.id.clone())),
+            },
             // ←/→ (h/l) belong to the tab strip, always
             _ => Took::No,
         };
@@ -229,8 +229,8 @@ pub fn review_key(r: &mut ReviewView, key: &KeyEvent) -> Took {
     }
     match key.code {
         // On the action row ↓ keeps walking: along the buttons, then off the end
-        // and back to the top of the list. One key reaches everything; ←/→ are
-        // still there but no longer the only way onto the second button.
+        // and back to the top of the list. One key reaches everything; ←/→
+        // still work; ↓ also reaches the second button.
         KeyCode::Down | KeyCode::Char('j') if r.sel == r.action_row() => {
             if r.buttons.sel + 1 < r.buttons.labels.len() {
                 r.buttons.sel += 1;
@@ -301,8 +301,8 @@ pub fn review_key(r: &mut ReviewView, key: &KeyEvent) -> Took {
 
 /// The Review tab: what was flagged (with the controls to act on it), then
 /// the reviewer's reasoning and the spend side by side — two short, unrelated
-/// things that were stacked and each got half the height they needed — and
-/// the decision last, as a conclusion.
+/// things side by side, so each gets the height it needs — and the decision
+/// last, as a conclusion.
 pub fn render_review_tab(f: &mut Frame, area: Rect, v: &ReviewView) {
     // The comment and the ledger take what their content needs and never more
     // than half the screen — they are reference material, and the findings are
@@ -315,7 +315,7 @@ pub fn render_review_tab(f: &mut Frame, area: Rect, v: &ReviewView) {
     // The stage box sits at the foot of the tab: its content when ready, one
     // line when muted. It comes out of the panes' half, never the findings', so
     // the thing you act on keeps its room.
-    // +1 on the border rows for the blank first line every box now carries.
+    // +1 on the border rows for the blank first line every box carries.
     let stage_h = match &v.stage {
         None => 4,
         Some(s) => {
@@ -363,9 +363,8 @@ pub fn render_review_tab(f: &mut Frame, area: Rect, v: &ReviewView) {
         Layout::vertical([Constraint::Min(4), Constraint::Length(4), Constraint::Length(3)])
             .areas(find_inner);
     // What each finding IS on the left, what the reviewer said about it on the
-    // right. Stacked, one finding was three wrapped lines and four of them
-    // filled the box; side by side the list stays a list. Each gets its own
-    // frame: two columns with a rule between them read as one block of text.
+    // right. Side by side the list stays a list. Each gets its own frame: two
+    // columns with a rule between them read as one block of text.
     let [list_a, why_a] =
         Layout::horizontal([Constraint::Percentage(42), Constraint::Min(24)]).areas(top_a);
     let frame = || {
@@ -416,8 +415,8 @@ pub fn render_review_tab(f: &mut Frame, area: Rect, v: &ReviewView) {
             ));
         }
     }
-    // One row per finding now, so the cursor's row IS its index — no wrapped
-    // measuring, just keep it on screen.
+    // One row per finding, so the cursor's row IS its index — just keep it on
+    // screen.
     let yoff = (v.sel as u16).saturating_sub(list_inner.height.saturating_sub(1));
     f.render_widget(Paragraph::new(list).scroll((yoff, 0)), list_inner);
 
@@ -455,22 +454,18 @@ pub fn render_review_tab(f: &mut Frame, area: Rect, v: &ReviewView) {
         .border_style(Style::new().fg(if on_note { Color::White } else { MODAL_BORDER }));
     let note_inner = note_box.inner(note_a);
     f.render_widget(note_box, note_a);
-    let w = note_inner.width.saturating_sub(1) as usize;
-    let xoff = v.note.cursor.saturating_sub(w);
+    let (xoff, cx) = hscroll(v.note.cursor, note_inner.width as usize);
     let hint = if v.note.value.is_empty() && !on_note {
         Paragraph::new(Line::styled(
             " optional: tell the fix lane anything else",
             Style::new().fg(Color::DarkGray),
         ))
     } else {
-        Paragraph::new(v.note.value.as_str()).scroll((0, xoff as u16))
+        Paragraph::new(v.note.value.as_str()).scroll((0, xoff))
     };
     f.render_widget(hint, note_inner);
     if on_note {
-        f.set_cursor_position(Position::new(
-            note_inner.x + (v.note.cursor - xoff) as u16,
-            note_inner.y,
-        ));
+        f.set_cursor_position(Position::new(note_inner.x + cx, note_inner.y));
     }
     v.buttons.render(f, btn_a, on_findings && v.sel == v.action_row());
 
@@ -625,10 +620,8 @@ impl App {
         let cost = crate::casefile::cost_rows(dir);
         let cost_total = crate::casefile::cost_total(&cost);
         let decision = r.verdict.verdict.to_string();
-        // The verdict used to be the last line of the tab — a conclusion after
-        // the evidence, which reads well and got missed. It is a box of its own
-        // above the findings now: the word, what it means, and the provenance
-        // that makes it checkable.
+        // The verdict is a box of its own above the findings: the word, what it
+        // means, and the provenance that makes it checkable.
         let verdict = Line::from(vec![
             Span::raw(" "),
             verdict_span(&decision).bold(),
@@ -725,7 +718,7 @@ mod tests {
         for code in [KeyCode::Left, KeyCode::Right, KeyCode::Char('h'), KeyCode::Char('l')] {
             assert!(matches!(review_key(&mut r, &press(code)), Took::No), "{code:?} must pass through");
         }
-        // ...and so is `m` for merge, from wherever you are
+        // any unbound letter passes through
         assert!(matches!(review_key(&mut r, &press(KeyCode::Char('m'))), Took::No));
 
         // ↵ on a finding ticks it
@@ -785,10 +778,10 @@ mod tests {
                 "{code:?} must reach the tab strip"
             );
         }
-        // and from the action row, which used to spend them on the buttons
+        // and from the action row
         r.sel = r.action_row();
         assert!(matches!(review_key(&mut r, &press(KeyCode::Right)), Took::No));
-        // ↓ is what walks the buttons now
+        // ↓ is what walks the buttons
         assert!(matches!(review_key(&mut r, &press(KeyCode::Down)), Took::Yes));
         assert_eq!(r.buttons.sel, 1);
     }
@@ -812,7 +805,7 @@ mod tests {
         let mut t = Terminal::new(TestBackend::new(COST_W, 8)).unwrap();
         let area = Rect::new(0, 0, COST_W, 8);
         let row = |b: &ratatui::buffer::Buffer, y: u16| {
-            (0..COST_W).map(|x| b[(x, y)].symbol().to_string()).collect::<String>()
+            screen_text(b).lines().nth(y as usize).unwrap().to_string()
         };
 
         t.draw(|f| render_cost(f, area, &v)).unwrap();
@@ -845,12 +838,9 @@ mod tests {
         // which prose lines are on screen, top to bottom — layout-independent,
         // so this keeps testing the scroll and not the box sizes
         let shown = |t: &Terminal<TestBackend>| -> Vec<u32> {
-            let b = t.backend().buffer();
-            (0..22)
-                .filter_map(|y| {
-                    let r: String = (0..100).map(|x| b[(x, y)].symbol().to_string()).collect();
-                    r.find("line").map(|i| r[i + 4..i + 6].parse().unwrap())
-                })
+            screen_text(t.backend().buffer())
+                .lines()
+                .filter_map(|r| r.find("line").map(|i| r[i + 4..i + 6].parse().unwrap()))
                 .collect()
         };
 
@@ -870,7 +860,7 @@ mod tests {
         assert_eq!(last.len(), first.len(), "same screenful, just scrolled");
     }
 
-    /// 3c/3d: a red letter in a box title means "press this to get there".
+    /// A red letter in a box title means "press this to get there".
     #[test]
     fn a_red_letter_jumps_straight_to_its_section() {
         let mut r = review_stub(2);
@@ -903,8 +893,7 @@ mod tests {
         assert!(r.focus == ReviewFocus::Summary);
     }
 
-    /// The action row used to be a dead end downwards: ↓ stopped on the first
-    /// button and only ←/→ reached the second.
+    /// ↓ must not dead-end on the first button; it walks the whole action row.
     #[test]
     fn down_walks_the_buttons_and_comes_back_round_to_the_list() {
         let mut r = review_stub(2);
@@ -934,7 +923,7 @@ mod tests {
                 && Cost.next() == Stage
                 && Stage.next() == Findings
         );
-        // prev is a real inverse now (not next().next()), so it survives four
+        // prev is a real inverse, so it survives four
         for f in [Findings, Summary, Cost, Stage] {
             assert!(f.prev().next() == f, "prev/next must be inverse");
             assert!(f.next() != f.prev(), "four variants: next and prev differ");

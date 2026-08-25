@@ -1,10 +1,10 @@
-use anyhow::{bail, Context, Result};
+use crate::git::git;
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::Path;
-use std::process::Command;
 
-/// Foreman's evidence contract: bind lane outcomes to the tree, not to the
+/// The evidence contract: bind lane outcomes to the tree, not to the
 /// model's narration. HEAD must never move; the content digest shows whether
 /// real edits happened.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,10 +22,9 @@ pub fn sha256_hex(data: &[u8]) -> String {
 /// Hash the tree's *content*, via the same patch the lane's work is captured
 /// from — the two can then never disagree about whether anything happened.
 ///
-/// This used to hash `git status --porcelain`, which is names and status codes
-/// only. In a fix or rework round the implementation is already applied, so
-/// every file it touches is *already* dirty and that output is byte-identical
-/// before and after real edits: genuine work was failing as `*_lane_noop`.
+/// Hashes patch content, not `git status` names: a names-only digest is
+/// byte-identical when an already-dirty file is edited again, so real work
+/// would read as a no-op.
 pub fn capture(dir: &Path) -> Result<TreeState> {
     let head = git(dir, &["rev-parse", "HEAD"])?;
     let content = crate::worktree::capture_patch(dir)?;
@@ -44,52 +43,10 @@ pub fn verdict(before: &TreeState, after: &TreeState) -> Result<bool> {
     Ok(before.content_sha256 != after.content_sha256)
 }
 
-/// True if the repo has at least one commit (HEAD resolves). A fresh
-/// `git init` has none, so `git worktree add`/`rev-parse HEAD` both fail.
-pub fn head_exists(repo: &Path) -> bool {
-    Command::new("git")
-        .args(["rev-parse", "--verify", "-q", "HEAD"])
-        .current_dir(repo)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// Ensure the repo has a baseline commit. The whole loop (worktrees, evidence
-/// digests, merge clean-tree check) needs a base tree; a fresh `git init` has
-/// none. Guv'nor bootstraps one from the current tree so a brand-new repo can
-/// run — the human still owns every *later* commit. Returns whether it created
-/// one. `.guvnor/runs/` stays out via the .gitignore init writes.
-pub fn ensure_baseline_commit(repo: &Path) -> Result<bool> {
-    if head_exists(repo) {
-        return Ok(false);
-    }
-    git(repo, &["add", "-A"])?;
-    git(repo, &["commit", "--allow-empty", "-m", "guvnor: baseline commit"])
-        .context("could not create the baseline commit (is git user.name/user.email set?)")?;
-    Ok(true)
-}
-
-pub fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .with_context(|| format!("git {args:?} failed to spawn"))?;
-    if !out.status.success() {
-        bail!(
-            "git {:?} in {} failed: {}",
-            args,
-            dir.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::ensure_baseline_commit;
 
     #[test]
     fn sha_is_stable() {
@@ -97,20 +54,6 @@ mod tests {
             sha256_hex(b""),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
-    }
-
-    #[test]
-    fn ensure_baseline_commit_bootstraps_fresh_repo() {
-        let dir = std::env::temp_dir().join(format!("guvnor-baseline-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
-        git(&dir, &["init", "-q"]).unwrap();
-        // commit identity comes from the ambient git config, same as real use
-        assert!(!head_exists(&dir)); // fresh init: no HEAD
-        assert!(ensure_baseline_commit(&dir).unwrap()); // creates it
-        assert!(head_exists(&dir));
-        assert!(!ensure_baseline_commit(&dir).unwrap()); // idempotent
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -124,9 +67,8 @@ mod tests {
         assert!(verdict(&a, &moved).is_err()); // unauthorized commit
     }
 
-    /// The bug this digest exists to catch: editing a file that is ALREADY dirty
-    /// leaves `git status --porcelain` untouched, so a content-blind digest calls
-    /// real work a silent no-op and fails the run.
+    /// Editing a file that is ALREADY dirty must still register as an edit —
+    /// the scenario `capture`'s content hash exists for.
     #[test]
     fn capture_sees_an_edit_to_an_already_dirty_file() {
         let dir = std::env::temp_dir().join(format!("guvnor-dirty-{}", std::process::id()));

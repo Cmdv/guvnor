@@ -22,7 +22,9 @@ use std::time::{Duration, Instant};
 
 mod case;
 mod commit;
+mod config_view;
 mod diff;
+mod fail;
 mod keys;
 mod progress;
 mod review;
@@ -37,7 +39,9 @@ mod widgets;
 // re-exported — nothing needs to reach back into them.
 pub use case::*;
 pub use commit::*;
+pub use config_view::*;
 pub use diff::*;
+pub use fail::*;
 pub use review::*;
 pub use runs::*;
 pub use spec::*;
@@ -60,7 +64,7 @@ pub fn run(verbose: bool) -> Result<i32> {
 /// without it ⇧↵ arrives as a plain ↵, and in a box where ↵ submits there is
 /// then no way to type a newline at all. Best effort — a terminal that doesn't
 /// understand the escape ignores it, and alt+↵ still works there.
-pub fn enter() -> DefaultTerminal {
+fn enter() -> DefaultTerminal {
     use ratatui::crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
     let t = ratatui::init();
     let _ = ratatui::crossterm::execute!(
@@ -72,7 +76,7 @@ pub fn enter() -> DefaultTerminal {
 
 /// Give it back. Paired with `enter`, because the keyboard flags outlive the
 /// alt screen and a shell that inherits them gets strange keys.
-pub fn leave() {
+fn leave() {
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
         ratatui::crossterm::event::PopKeyboardEnhancementFlags
@@ -124,13 +128,10 @@ pub enum Screen {
     Runs,
     Progress,
     /// The one screen a run has, at every stage: `TABS` is the journey and the
-    /// strip greys out what has not happened yet. There used to be a separate
-    /// spec screen for the "before it has run" half, which duplicated the Spec
-    /// tab and disagreed with it about how you approve things.
+    /// strip greys out what has not happened yet.
     ///
-    /// Boxed for the same reason its own `review` and `stage` are: `Screen` is
-    /// as big as its biggest variant, and with the spec screen gone this one is
-    /// eight times the next.
+    /// Boxed for the same reason its own `review` is: `Screen` is as big as its
+    /// biggest variant, and this variant is eight times the size of the next.
     Case(Box<CaseView>),
     /// The end of the road for a run: staged in your tree, or committed. Two
     /// different endings that both mean "guvnor is done and it's yours now".
@@ -216,7 +217,7 @@ pub fn toast(msg: impl Into<String>) -> Option<(String, Instant)> {
 }
 
 /// Append to the bounded lane-feed buffer, dropping the oldest line past the cap.
-pub fn push_capped(tail: &mut VecDeque<String>, line: String) {
+fn push_capped(tail: &mut VecDeque<String>, line: String) {
     if tail.len() >= 200 {
         tail.pop_front();
     }

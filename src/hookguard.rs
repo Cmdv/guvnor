@@ -12,7 +12,7 @@ use std::path::{Component, Path};
 /// could rewrite it could disable its own guard and then escape the repo.
 /// `.guvnor/` holds the config and the run evidence (patches, digests,
 /// verdicts); evidence a lane can edit is not evidence.
-pub const DENIED: &[&str] = &[".claude/", ".guvnor/"];
+const DENIED: &[&str] = &[".claude/", ".guvnor/"];
 
 /// The first denied prefix this repo-relative path falls under, if any.
 pub fn denied_prefix(rel: &str) -> Option<&'static str> {
@@ -29,13 +29,11 @@ pub fn run_write_guard() -> Result<i32> {
     let project_dir = std::env::var("CLAUDE_PROJECT_DIR")
         .unwrap_or_else(|_| std::env::current_dir().unwrap().display().to_string());
     // Per-run deny list: exact repo-relative paths an earlier lane already owns.
-    // ponytail: CSV — repo paths with commas would need quoting; not seen yet.
-    let deny: Vec<String> = std::env::var("GUVNOR_DENY")
-        .unwrap_or_default()
-        .split(',')
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
+    // Read from `.claude/deny` (written by `lane::write_settings`), NUL-joined —
+    // the one byte no POSIX path can ever contain, so it needs no escaping.
+    let deny_raw = std::fs::read_to_string(Path::new(&project_dir).join(".claude/deny")).unwrap_or_default();
+    let deny: Vec<String> =
+        deny_raw.split('\0').filter(|s| !s.is_empty()).map(str::to_string).collect();
     match check_write(file_path, &project_dir, &deny) {
         Ok(()) => Ok(0),
         Err(msg) => {
@@ -48,9 +46,9 @@ pub fn run_write_guard() -> Result<i32> {
 /// Reads are fenced to the worktree too. Three reasons, in order of severity:
 /// the main repo's `.guvnor/runs/<id>/tests.patch` is readable by absolute path
 /// from an implementer worktree (a decorrelation hole); a lane's own
-/// `.claude/settings.json` embeds `GUVNOR_DENY`, which names the test files;
-/// and a read of `~/Documents` or similar makes the OS raise a consent dialog
-/// that headless `claude -p` cannot answer, so the lane hangs until timeout.
+/// `.claude/deny` file names the test files it must not see; and a read of
+/// `~/Documents` or similar makes the OS raise a consent dialog that headless
+/// `claude -p` cannot answer, so the lane hangs until timeout.
 pub fn run_read_guard() -> Result<i32> {
     let input = read_stdin()?;
     let v: Value = serde_json::from_str(&input).unwrap_or(Value::Null);
@@ -211,8 +209,9 @@ mod tests {
         // the decorrelation hole: the real repo's evidence, by absolute path
         assert!(check_read("/repo/.guvnor/runs/x/tests.patch", "/wt").is_err());
         assert!(check_read(".guvnor/runs/x/tests.patch", "/wt").is_err());
-        // GUVNOR_DENY in the lane's own settings names the test files
+        // the lane's own .claude/deny file names the test files
         assert!(check_read(".claude/settings.json", "/wt").is_err());
+        assert!(check_read(".claude/deny", "/wt").is_err());
         // outside the worktree at all — this is what makes the OS prompt
         assert!(check_read("/Users/me/Documents/x", "/wt").is_err());
         assert!(check_read("src/../../secrets", "/wt").is_err());

@@ -31,8 +31,9 @@ impl EventLog {
 }
 
 pub fn now_iso() -> String {
-    // ponytail: epoch-seconds ISO without pulling in chrono; per-second
-    // resolution is enough for an audit trail ordered by append.
+    // Epoch-seconds ISO, no chrono dependency. Two events in the same second
+    // are still ordered correctly: append order to events.ndjson IS the sort
+    // key, so sub-second precision would add nothing.
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     let days = secs / 86_400;
     let (y, mo, d) = civil_from_days(days as i64);

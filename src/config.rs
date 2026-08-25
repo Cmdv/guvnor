@@ -51,7 +51,7 @@ impl Default for Claude {
 #[serde(default)]
 pub struct Limits {
     pub lane_timeout_secs: u64,
-    /// Foreman-style rework budget: on a failed green gate the implementer
+    /// Rework budget: on a failed green gate the implementer
     /// gets the failing output back this many times before the run fails.
     pub max_rework_rounds: u64,
 }
@@ -94,7 +94,7 @@ pub fn find_repo_root() -> Result<PathBuf> {
             return Ok(dir);
         }
         if !dir.pop() {
-            bail!("no .guvnor/guvnor.toml found here or above; run `guvnor init` in the target repo");
+            bail!("no .guvnor/guvnor.toml found here or above; run `guvnor` in the target repo to set one up");
         }
     }
 }
@@ -113,12 +113,7 @@ pub fn find_git_root() -> Result<PathBuf> {
 }
 
 /// Create `.guvnor/` scaffolding + template config. Idempotent; returns the
-/// config path. Shared by `guvnor init` and the TUI's in-app init.
-pub fn init_repo(dir: &Path) -> Result<PathBuf> {
-    init_repo_with(dir, "node --test", &["test/"], &["src/"])
-}
-
-/// Init with language-specific command/paths (TUI language picker).
+/// config path. The TUI's in-app init, keyed to its language picker.
 pub fn init_repo_with(dir: &Path, test: &str, tests: &[&str], src: &[&str]) -> Result<PathBuf> {
     if !dir.join(".git").exists() {
         bail!("run inside a git repository");
@@ -126,7 +121,7 @@ pub fn init_repo_with(dir: &Path, test: &str, tests: &[&str], src: &[&str]) -> R
     let guvnor_dir = dir.join(".guvnor");
     std::fs::create_dir_all(guvnor_dir.join("runs"))?;
     // Run artifacts are local evidence, not repo content; without this the
-    // merge clean-tree check trips over guvnor's own files.
+    // stage clean-tree check trips over guvnor's own files.
     std::fs::write(guvnor_dir.join(".gitignore"), "runs/\n")?;
     let cfg = guvnor_dir.join("guvnor.toml");
     if !cfg.exists() {
@@ -183,7 +178,7 @@ pub fn save_settings(repo: &Path, s: &Settings) -> Result<PathBuf> {
 }
 
 /// Render a guvnor.toml with the given command/paths (comments included).
-pub fn config_toml(test: &str, tests: &[&str], src: &[&str]) -> String {
+fn config_toml(test: &str, tests: &[&str], src: &[&str]) -> String {
     let list =
         |xs: &[&str]| xs.iter().map(|x| format!("\"{x}\"")).collect::<Vec<_>>().join(", ");
     format!(

@@ -5,8 +5,6 @@ use crate::spec::Spec;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
-/// btop-style hints: single-letter keys are highlighted red inside the label
-/// (`┤ filter ├` with a red f); other keys are a red prefix (`┤ j/k select ├`).
 /// Break reviewer prose into readable paragraphs. Models emit one long run of
 /// sentences; the terminal then wraps it into an unreadable slab. Split on
 /// sentence ends and group a few per paragraph, with a blank line between, so
@@ -68,7 +66,7 @@ pub struct SpecSection {
     pub body: Vec<Line<'static>>,
 }
 
-pub fn spec_file_line(f: &str) -> Line<'static> {
+fn spec_file_line(f: &str) -> Line<'static> {
     let mut spans = vec![Span::styled("‣ ", Style::new().fg(Color::DarkGray))];
     let (head, desc) = match f.split_once(':') {
         Some((h, d)) => (h.to_string(), Some(d.to_string())),
@@ -93,7 +91,7 @@ pub fn spec_file_line(f: &str) -> Line<'static> {
     Line::from(spans)
 }
 
-pub fn spec_interface_line(i: &str) -> Line<'static> {
+fn spec_interface_line(i: &str) -> Line<'static> {
     let mut spans = vec![Span::styled("‣ ", Style::new().fg(Color::DarkGray))];
     let rest = match i.split_once(": ") {
         // leading repo path ("src/math/stats.js: ...") — no spaces/parens in it
@@ -257,7 +255,7 @@ pub fn strip_wt_paths(s: &str) -> String {
     out
 }
 
-pub fn c_len(s: &str, i: usize) -> usize {
+fn c_len(s: &str, i: usize) -> usize {
     s[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1)
 }
 
@@ -287,41 +285,41 @@ pub fn failure_line(l: &str) -> Line<'static> {
 /// read the failure.
 pub fn last_ticked(dir: &std::path::Path) -> Vec<String> {
     let Ok(raw) = std::fs::read_to_string(dir.join("events.ndjson")) else { return Vec::new() };
-    let mut found = Vec::new();
-    for l in raw.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(l) else { continue };
-        if v["event"] == "fix_started" {
-            found = v["data"]["ticked"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .map(|f| {
-                            let file = f["file"].as_str().unwrap_or("");
-                            let note = f["note"].as_str().unwrap_or("");
-                            if file.is_empty() { note.into() } else { format!("{file} — {note}") }
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-        }
-    }
-    found
+    // the last `fix_started` wins, so scan from the tail
+    raw.lines()
+        .rev()
+        .find_map(|l| {
+            let v = serde_json::from_str::<serde_json::Value>(l).ok()?;
+            (v["event"] == "fix_started").then(|| {
+                v["data"]["ticked"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .map(|f| {
+                                let file = f["file"].as_str().unwrap_or("");
+                                let note = f["note"].as_str().unwrap_or("");
+                                if file.is_empty() { note.into() } else { format!("{file} — {note}") }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+        })
+        .unwrap_or_default()
 }
 
 pub fn last_failure(dir: &std::path::Path) -> Option<(String, String)> {
     let raw = std::fs::read_to_string(dir.join("events.ndjson")).ok()?;
-    let mut found = None;
-    for l in raw.lines() {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(l) {
-            if v["event"] == "run_failed" {
-                found = Some((
-                    v["data"]["why"].as_str().unwrap_or("").to_string(),
-                    v["data"]["detail"].as_str().unwrap_or("").to_string(),
-                ));
-            }
-        }
-    }
-    found
+    // the last `run_failed` wins, so scan from the tail
+    raw.lines().rev().find_map(|l| {
+        let v = serde_json::from_str::<serde_json::Value>(l).ok()?;
+        (v["event"] == "run_failed").then(|| {
+            (
+                v["data"]["why"].as_str().unwrap_or("").to_string(),
+                v["data"]["detail"].as_str().unwrap_or("").to_string(),
+            )
+        })
+    })
 }
 
 #[cfg(test)]
