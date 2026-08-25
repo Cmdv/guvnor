@@ -1,0 +1,81 @@
+# Tag-driven binary releases. `git tag v0.1.1 && git push --tags` is the whole
+# ritual: `check` gates the build and drafts the release, `build` fills it, and
+# `publish` flips it live only once every target is in it. A target that fails
+# leaves the release a draft, so a half-populated release is never downloadable.
+#
+# No Windows: lane.rs supervises `claude` through setsid/killpg and harness.rs
+# runs the test command through `sh -c`, so the target does not compile. The
+# linux-musl binary is static and works under WSL.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Debug, not --release: overflow checks are on in debug, and a usize
+      # underflow is a bug class this codebase has actually had.
+      - run: cargo test
+      - run: cargo clippy --all-targets -- -D warnings
+      - name: the tag is the version users report, so make them match
+        run: |
+          pkgid=$(cargo pkgid)
+          want="v${pkgid##*[#@]}"
+          if [ "$want" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml ($want)" >&2
+            exit 1
+          fi
+      - name: draft the release
+        run: gh release create "$GITHUB_REF_NAME" --draft --generate-notes --title "$GITHUB_REF_NAME"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  build:
+    needs: check
+    # One failed target must not cancel the others: the release stays a draft
+    # and the failure can be retried on its own.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: macos-latest, target: x86_64-apple-darwin }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      # musl links statically, so the binary runs on any distro (and under WSL)
+      # rather than against the runner's glibc.
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --target ${{ matrix.target }}
+      # No wrapper directory: `tar xzf` drops `guvnor` straight into cwd. LICENSE
+      # rides along because Apache-2.0 section 4(a) asks for a copy with the work.
+      - run: |
+          tar -czf guvnor-${{ matrix.target }}.tar.gz \
+            -C target/${{ matrix.target }}/release guvnor \
+            -C "$GITHUB_WORKSPACE" LICENSE
+      - run: gh release upload "$GITHUB_REF_NAME" guvnor-${{ matrix.target }}.tar.gz --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - run: gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
