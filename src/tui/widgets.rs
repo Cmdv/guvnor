@@ -35,7 +35,9 @@ impl Scroll {
     /// return the offset to draw at — clamped, so a resize can't leave a stale
     /// offset showing an empty box for one frame.
     pub fn fit(&self, content: usize, h: u16) -> u16 {
-        self.max.set((content as u16).saturating_sub(h));
+        // Saturate, don't truncate: a wrapped body past u16::MAX rows would wrap
+        // to a near-zero ceiling and refuse to scroll at all.
+        self.max.set(u16::try_from(content).unwrap_or(u16::MAX).saturating_sub(h));
         self.off.min(self.max.get())
     }
 }
@@ -89,7 +91,9 @@ impl LineInput {
     pub fn handle(&mut self, key: &KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Char(c) => {
+            // Ctrl+letter arrives as Char('u') + CONTROL, so without the guard
+            // the reflex for "kill this line" types a `u` into the field.
+            KeyCode::Char(c) if !ctrl => {
                 if self.max > 0 && self.value.chars().count() >= self.max {
                     return;
                 }
@@ -439,7 +443,8 @@ impl TextArea {
         }
         let w = self.w.get();
         match key.code {
-            KeyCode::Char(c) => {
+            // Same as LineInput: a Ctrl+letter shortcut must not become text.
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.delete_selection();
                 let i = Self::byte_index(&self.lines[self.row], self.col);
                 self.lines[self.row].insert(i, c);
@@ -521,16 +526,27 @@ impl Buttons {
     pub fn handle(&mut self, code: KeyCode) -> Option<usize> {
         match code {
             KeyCode::Left | KeyCode::Char('h') => {
-                self.sel = self.sel.saturating_sub(1);
+                self.prev();
                 None
             }
             KeyCode::Right | KeyCode::Char('l') => {
-                self.sel = (self.sel + 1).min(self.labels.len() - 1);
+                self.next();
                 None
             }
             KeyCode::Enter => Some(self.sel),
             _ => None,
         }
+    }
+
+    /// Move the selection, clamped. A row with no labels is a real state (a
+    /// committed run offers no actions), so the last index has to saturate:
+    /// `len() - 1` on an empty list underflows.
+    pub fn next(&mut self) {
+        self.sel = (self.sel + 1).min(self.labels.len().saturating_sub(1));
+    }
+
+    pub fn prev(&mut self) {
+        self.sel = self.sel.saturating_sub(1);
     }
 
     /// Each action as its own bordered button, side by side. 3 rows tall. No
@@ -724,6 +740,41 @@ mod tests {
             i.handle(&KeyEvent::from(KeyCode::Char(c)));
         }
         assert_eq!(i.value, "ab");
+    }
+
+    /// Ctrl+letter is a shortcut, not text. crossterm reports Ctrl+U as
+    /// `Char('u') + CONTROL`, so without the guard the reflex for "kill the
+    /// line" typed a `u` into every field in the app.
+    #[test]
+    fn ctrl_letters_are_not_typed_into_a_field() {
+        let ctrl = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let mut li = LineInput::with("abc");
+        for c in ['u', 'a', 'w', 'd', 'v'] {
+            li.handle(&ctrl(c));
+        }
+        assert_eq!(li.value, "abc");
+        assert_eq!(li.cursor, 3);
+
+        let mut ta = TextArea::from("abc");
+        for c in ['u', 'w'] {
+            ta.handle(&ctrl(c));
+        }
+        assert_eq!(ta.value(), "abc");
+        // a plain letter still types
+        li.handle(&press(KeyCode::Char('d')));
+        assert_eq!(li.value, "abcd");
+    }
+
+    /// A committed run offers no actions, so `Buttons` with no labels is a real
+    /// state. `len() - 1` on it underflows.
+    #[test]
+    fn an_empty_button_row_takes_keys_without_panicking() {
+        let mut b = Buttons::new(&[], &[Color::Green, Color::Gray]);
+        assert_eq!(b.handle(KeyCode::Right), None);
+        assert_eq!(b.handle(KeyCode::Char('l')), None);
+        b.next();
+        b.prev();
+        assert_eq!(b.sel, 0);
     }
 
     #[test]

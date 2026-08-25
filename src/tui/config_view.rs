@@ -239,15 +239,17 @@ impl App {
             "timeout (s)",
             "rework rounds",
         ];
+        // Values start at column 19 (marker + padded label) and run to the edge.
+        let value_w = inner.width.saturating_sub(19) as usize;
+        // The row being edited scrolls under its cursor. Only that row: the rest
+        // are not being typed into, so their overflow is just clipped.
+        let scroll = cv.text_input(cv.row).map(|inp| hscroll(inp.cursor, value_w));
         let mut lines: Vec<Line> = vec![Line::raw("")]; // lead blank, like every box
         for (i, label) in labels.iter().enumerate() {
             let sel = i == cv.row;
             if i > 0 {
                 lines.push(Line::raw("")); // one blank between every option
             }
-            // No h-scroll inside the modal, by design: a toml value too long for this
-            // box to show is a value that belongs in $EDITOR, which is always one key
-            // away.
             let value = match i {
                 0 => format!("◀ {} ▶", LANG_PRESETS[cv.preset].0),
                 1 => cv.test.value.clone(),
@@ -258,6 +260,10 @@ impl App {
                 8 => cv.bin.value.clone(),
                 9 => cv.timeout.value.clone(),
                 _ => cv.rework.value.clone(),
+            };
+            let value = match scroll.filter(|_| sel) {
+                Some((off, _)) => value.chars().skip(off as usize).take(value_w).collect(),
+                None => value,
             };
             lines.push(Line::from(vec![
                 Span::raw(if sel { " ▶ " } else { "   " }),
@@ -273,11 +279,8 @@ impl App {
         f.render_widget(Paragraph::new(lines).scroll((off, 0)), inner);
         // `text_input` is the one row→field table, shared with the key
         // handler — the cursor cannot sit on a row the keys don't edit.
-        if let Some(inp) = cv.text_input(cv.row) {
-            f.set_cursor_position(Position::new(
-                inner.x + 19 + inp.cursor as u16,
-                inner.y + y - off,
-            ));
+        if let Some((_, cx)) = scroll {
+            f.set_cursor_position(Position::new(inner.x + 19 + cx, inner.y + y - off));
         }
         // model version dropdown, overlaying the seat rows
         if let Some((sel, options)) = &cv.drop {

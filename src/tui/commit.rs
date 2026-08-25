@@ -245,8 +245,14 @@ pub fn commit_key(app: &mut App, key: &KeyEvent) -> Option<Go> {
                 return commit_now(app);
             }
             let full = if body.is_empty() { subject } else { format!("{subject}\n\n{body}") };
+            // Checked before the copy, not after: `copy` is the armed button, so
+            // a stray ↵ on a fresh modal used to hand pbcopy an empty string and
+            // wipe the clipboard while reporting that nothing had happened.
+            if full.trim().is_empty() {
+                app.toast = toast("nothing to copy yet");
+                return None;
+            }
             app.toast = match clipboard(&full) {
-                Ok(()) if full.trim().is_empty() => toast("nothing to copy yet"),
                 Ok(()) => toast("message copied to clipboard"),
                 Err(e) => toast(e),
             };

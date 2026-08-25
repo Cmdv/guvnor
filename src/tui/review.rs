@@ -168,12 +168,11 @@ pub fn review_key(r: &mut ReviewView, key: &KeyEvent) -> Took {
         let Some(stage) = r.stage.as_mut() else { return Took::No };
         return match key.code {
             KeyCode::Down | KeyCode::Char('j') => {
-                stage.buttons.sel =
-                    (stage.buttons.sel + 1).min(stage.buttons.labels.len().saturating_sub(1));
+                stage.buttons.next();
                 Took::Yes
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                stage.buttons.sel = stage.buttons.sel.saturating_sub(1);
+                stage.buttons.prev();
                 Took::Yes
             }
             KeyCode::PageDown => {
@@ -417,7 +416,11 @@ pub fn render_review_tab(f: &mut Frame, area: Rect, v: &ReviewView) {
     }
     // One row per finding, so the cursor's row IS its index — just keep it on
     // screen.
-    let yoff = (v.sel as u16).saturating_sub(list_inner.height.saturating_sub(1));
+    // `sel` also addresses the instruction box and the button row below the
+    // list, which are not findings: scrolling to those would drag the list past
+    // its last real row and take the finding being read off the top.
+    let last = v.live.len().saturating_sub(1);
+    let yoff = (v.sel.min(last) as u16).saturating_sub(list_inner.height.saturating_sub(1));
     f.render_widget(Paragraph::new(list).scroll((yoff, 0)), list_inner);
 
     // The reason, for whichever finding the cursor is on — its own box, titled
@@ -627,7 +630,15 @@ impl App {
             verdict_span(&decision).bold(),
             Span::styled(format!("  {}", verdict_means(r.verdict.verdict)), Style::new()),
             Span::styled(
-                format!("   {} · {} · diff {}", r.model, r.ts, &r.diff_sha256[..12.min(r.diff_sha256.len())]),
+                // chars, not bytes: review.json is read back off disk without
+                // validation, and slicing a multibyte field mid-character panics
+                // the whole screen.
+                format!(
+                    "   {} · {} · diff {}",
+                    r.model,
+                    r.ts,
+                    r.diff_sha256.chars().take(12).collect::<String>()
+                ),
                 Style::new().fg(Color::DarkGray),
             ),
         ]);

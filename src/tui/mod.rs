@@ -524,14 +524,21 @@ impl App {
                 }
             }
             // Back into the modal that asked, never onto another screen.
-            (JobKind::Draft, Outcome::Done(msg)) => match self.commit.as_mut() {
-                Some(v) => v.set_message(&msg),
-                // modal closed while it was thinking: the words are still worth
-                // having, and losing them silently would be the worse bug
-                None => self.toast = toast("commit message drafted — reopen with c"),
-            },
+            // Matched on the run that asked, so a draft can never land in another
+            // run's modal: `open_commit` refuses to show run X's words under run
+            // Y, and this arrives asynchronously enough to have done just that.
+            (JobKind::Draft, Outcome::Done(msg)) => {
+                match self.commit.as_mut().filter(|v| job.run_id.as_deref() == Some(&v.id)) {
+                    Some(v) => v.set_message(&msg),
+                    // modal closed while it was thinking: the words are still worth
+                    // having, and losing them silently would be the worse bug
+                    None => self.toast = toast("commit message drafted — reopen with c"),
+                }
+            }
             (JobKind::Draft, out) => {
-                if let Some(v) = self.commit.as_mut() {
+                if let Some(v) =
+                    self.commit.as_mut().filter(|v| job.run_id.as_deref() == Some(&v.id))
+                {
                     v.drafting = false;
                 }
                 self.toast = toast(match out {

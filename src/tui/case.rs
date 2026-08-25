@@ -500,16 +500,19 @@ impl App {
             render_textarea(f, text_a, &fb.text, !fb.on_buttons);
         }
         if let Some(note) = &v.note {
+            // Scrolled like every other one-line field: without this the text
+            // stops at the box edge while the cursor keeps walking right, so
+            // past ~70 characters you are typing blind.
+            let (xoff, cx) = hscroll(note.cursor, note_a.width.saturating_sub(2) as usize);
             f.render_widget(
-                Paragraph::new(note.value.as_str())
-                    .block(
-                        boxed("rejection note (↵ confirm · esc cancel)", Style::new())
-                            .border_style(Style::new().fg(Color::Red))
-                            .title_style(Style::new().fg(Color::Red)),
-                    ),
+                Paragraph::new(note.value.as_str()).scroll((0, xoff)).block(
+                    boxed("rejection note (↵ confirm · esc cancel)", Style::new())
+                        .border_style(Style::new().fg(Color::Red))
+                        .title_style(Style::new().fg(Color::Red)),
+                ),
                 note_a,
             );
-            f.set_cursor_position(Position::new(note_a.x + 1 + note.cursor as u16, note_a.y + 1));
+            f.set_cursor_position(Position::new(note_a.x + 1 + cx, note_a.y + 1));
         }
     }
 
