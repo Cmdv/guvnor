@@ -1,3 +1,35 @@
+```
+   ░█▀▀░█░█░█░█░▀░█▀█░█▀█░█▀▄
+   ░█░█░█░█░▀▄▀░░░█░█░█░█░█▀▄
+   ░▀▀▀░▀▀▀░░▀░░░░▀░▀░▀▀▀░▀░▀
+
+            ░░░░░░░░
+         ░░░░██████░░░░
+       ░░░████████████░░░░
+    ░░░███████████████████░░
+   ░████████████████████████░░
+ ░░██████████████████████████░░
+ ░░░░░░░░░░██████████░░░░░░░░░░
+ ░█████████░░░████░░░█████████░
+░░█░░░░░░░░░██░██░██░░░░░░░░░█░░
+░█░░░░░░░░░░░░░░░░░░░░░░░░░░░░█░
+░░█░░░░░░░░░░░░██░░░░░░░░░░░░█░░
+ ░██░░░░░░░░░░░██░░░░░░░░░░░██░
+ ░███████░█░████████░█░███████░
+ ░████████████░██░████████████░
+ ░░███████████░██░███████████░░
+  ░░░████████░████░███████░░░
+     ░░███░██░░░░░░██░███░░░
+      ░░██░█░░████░░█░██░░
+       ░███░        ░███░
+       ░░██░░      ░░██░░
+       ░░██░░      ░░██░░
+        ░██░░      ░░██░
+        ░░█░░      ░░█░░
+        ░░█░░      ░░█░░
+         ░░░░      ░░░░
+```
+
 # guvnor
 
 Spec-gated feature orchestrator: LLM lanes type, evidence decides, humans hold
@@ -52,99 +84,69 @@ reviewer read.
 
 ## Flow
 
+Three phases, one per verb. `▭` LLM lane · `◇` deterministic gate (no model
+involved) · `⬡` you · `▱` artifact on disk. Bold = happy path, dotted = loop.
+
+**1 · plan** — draft a spec and argue with it. Nothing downstream exists yet.
+
 ```mermaid
 flowchart TD
-    START([guvnor plan]) --> PLANNER
-
-    PLANNER["<b>planner lane</b><br/>model_planner · repo root<br/>sees: title + context + repo<br/>writes: nothing (read-only tools)"]
-    PLANNER --> SPEC[/"spec.json<br/>Objective · Files · Interfaces<br/>Constraints · Verification"/]
-
-    SPEC --> GSPEC{{"<b>YOU approve the spec</b><br/>binds sha256(spec.json)<br/>edit · iterate · approve · reject"}}
-    GSPEC -.->|"iterate with feedback"| REPLAN["<b>planner lane</b> (same session)<br/>sees: prior spec + your feedback"]
-    REPLAN --> SPEC
-
-    GSPEC ==>|approved| BASE
-
-    BASE{"<b>baseline</b><br/>run test cmd on base tree<br/>wt-verif"}
-    BASE -->|"RED — nothing to prove against"| FAIL
-    BASE ==>|GREEN| TESTLANE
-
-    TESTLANE["<b>test-writer lane</b><br/>model_worker · wt-tests<br/>sees: spec only<br/>writes: whole repo except .guvnor/ .claude/"]
-    TESTLANE --> TP[/"tests.patch"/]
-    TP --> RED
-
-    RED{"<b>red gate</b><br/>tests must FAIL on base<br/>wt-verif + tests.patch"}
-    RED -->|"GREEN — tests pass with no implementation"| FAIL
-    RED ==>|FAILS as required| IMPLLANE
-
-    IMPLLANE["<b>implementer lane</b><br/>model_worker · wt-impl<br/>sees: spec only — <b>never the tests</b><br/>writes: whole repo except .guvnor/ .claude/<br/>and every path tests.patch owns"]
-    IMPLLANE --> IP[/"impl.patch"/]
-    IP --> OVERLAP
-
-    OVERLAP{"<b>composability</b><br/>do the two patches<br/>touch the same files?"}
-    OVERLAP -->|yes — cannot both apply| FAIL
-    OVERLAP ==>|disjoint| GREEN
-
-    GREEN{"<b>green gate</b><br/>tests must PASS<br/>wt-verif + tests.patch + impl.patch"}
-    GREEN -.->|"RED · rework budget left"| REWORK
-    GREEN -->|"RED · budget spent"| FAIL
-    GREEN ==>|PASSES| REVIEWER
-
-    REWORK["<b>implementer lane</b> · rework n/max<br/>model_worker · wt-impl (same tree)<br/>sees: spec + failing output as UNTRUSTED data<br/>still never sees the tests"]
-    REWORK --> IP
-
-    REVIEWER["<b>reviewer lane</b><br/>model_reviewer · wt-verif<br/>sees: spec + diff + the green gate's own test output<br/>writes: nothing. No shell: a claim to have<br/>re-run anything proves nothing"]
-    REVIEWER --> RJ[/"review.json<br/>APPROVED · WARNING · BLOCKED<br/>findings + sha256(diff)"/]
-
-    RJ --> TRIAGE{{"<b>YOU triage the findings</b><br/>tick the ones worth fixing<br/>already-fixed ones are green and inert<br/>a re-raised one is flagged"}}
-    TRIAGE -.->|"findings ticked"| FIXLANE
-    TRIAGE ==>|"nothing ticked"| GATES
-
-    FIXLANE["<b>implementer lane</b> · fix round<br/>model_worker · wt-impl rebuilt from impl.patch<br/>sees: spec + <b>only the ticked findings</b> as UNTRUSTED data<br/>still never sees the tests"]
-    FIXLANE --> GREEN2
-
-    GREEN2{"<b>green gate</b><br/>tests must STILL pass<br/>a fix that breaks green is not a fix"}
-    GREEN2 -->|RED| FAIL
-    GREEN2 -.->|"PASSES · work approval reset,<br/>ticked findings recorded as fixed"| REVIEWER
-
-    GATES{{"<b>YOU approve each tab</b><br/>Spec · Tests · Work<br/>each tab carries its own diff + evidence<br/>↵ on a tab → approve (preselected) or reject"}}
-
-    GATES --> STAGE{"<b>stage</b><br/>all three gates approved<br/>sha256(diff) still matches the review<br/>your tree clean"}
-    STAGE --> STAGED[/"in YOUR working tree, uncommitted<br/>open it · run it · git diff --cached"/]
-    STAGED --> LOOK{{"<b>YOU decide</b><br/>guvnor commit · guvnor unstage · or just git commit yourself"}}
-    LOOK -.->|"unstage: reverse-applied,<br/>artifacts kept"| GATES
-    LOOK --> DONE[/"committed, bound to the staged tree<br/><b>guvnor never pushes</b>"/]
-
-    FAIL[["<b>run failed</b><br/>reason + evidence kept in .guvnor/runs/&lt;id&gt;/<br/>no blind retry"]]
-    FAIL -.->|tighten the spec, run again| GSPEC
-
-    classDef lane fill:#2d3142,stroke:#7c8cff,color:#eaeaea
-    classDef gate fill:#1f2d2b,stroke:#4caf82,color:#eaeaea
-    classDef human fill:#3a3222,stroke:#e3b341,color:#eaeaea
-    classDef art fill:#22252e,stroke:#5a6270,color:#c8ccd4
-    classDef bad fill:#3a2222,stroke:#e06c6c,color:#eaeaea
-
-    class PLANNER,REPLAN,TESTLANE,IMPLLANE,REWORK,REVIEWER,FIXLANE lane
-    class BASE,RED,OVERLAP,GREEN,GREEN2,STAGE gate
-    class GSPEC,TRIAGE,GATES,LOOK human
-    class SPEC,TP,IP,RJ,STAGED,DONE art
-    class FAIL bad
+    A(["guvnor plan"]) --> P["planner lane"]
+    P --> S[/"spec.json"/]
+    S --> G{{"YOU approve the spec"}}
+    G -.->|"feedback, same session"| P
+    G ==>|"binds sha256(spec.json)"| R(["guvnor run"])
 ```
 
-**Legend** — `▭` LLM lane (model seat · worktree · what it can see and write) ·
-`◇` deterministic gate (guvnor decides, no model involved) · `⬡` human gate ·
-`▱` artifact on disk. Bold arrows are the happy path; dotted arrows are loops.
+**2 · run** — the lanes type, the gates decide. Any gate can fail the run; the
+evidence is kept either way, and there is no blind retry.
 
-Each lane is a throwaway `git worktree` under `.guvnor/wt/`, running a headless
-`claude -p` with its own hook-enforced write fence. Every run leaves its full
-evidence trail in `.guvnor/runs/<id>/`.
+```mermaid
+flowchart TD
+    B{"baseline<br/>green on base?"} ==> T["test-writer lane<br/>sees the spec only"]
+    T --> RG{"red gate<br/>do the tests fail on base?"}
+    RG ==> I["implementer lane<br/>sees the spec only"]
+    I --> OV{"composable?<br/>the two patches must be disjoint"}
+    OV ==> GG{"green gate<br/>do the tests pass now?"}
+    GG ==> V["reviewer lane<br/>diff + criteria, no shell"]
+    V --> J[/"review.json + sha256(diff)"/]
+    GG -.->|"red, rework budget left"| I
+    B & RG & OV & GG --> F[["run failed<br/>reason + evidence kept"]]
+```
+
+**3 · land** — you triage, you approve, you look at it in your own tree.
+
+```mermaid
+flowchart TD
+    J[/"review.json"/] --> TR{{"YOU triage the findings"}}
+    TR -.->|"some ticked"| FX["fix lane<br/>only the ticked findings"]
+    FX --> G2{"green gate<br/>a fix that breaks green is not a fix"}
+    G2 -.->|"re-review"| TR
+    TR ==>|"nothing left to fix"| AP{{"YOU approve each tab<br/>Spec · Tests · Work"}}
+    AP ==>|"guvnor stage"| ST[/"in YOUR tree, uncommitted<br/>open it · run it · git diff --cached"/]
+    ST -.->|"guvnor unstage"| AP
+    ST ==> C(["guvnor commit<br/>bound to the staged tree"])
+```
+
+Every lane is one headless `claude -p` in a throwaway `git worktree` under
+`.guvnor/wt/`, with a hook-enforced write fence and a fixed field of view:
+
+| lane | seat | worktree | sees | writes |
+|---|---|---|---|---|
+| planner | `model_planner` | repo root | title, context, the repo | nothing — read-only tools |
+| test-writer | `model_worker` | `wt-tests` | the spec only | anything but `.guvnor/` `.claude/` |
+| implementer | `model_worker` | `wt-impl` | the spec only — **never the tests** | the same, minus every path `tests.patch` owns |
+| reviewer | `model_reviewer` | `wt-verif` | spec + diff + the green gate's own output | nothing, and it has no shell |
+
+The rework and fix rounds are the implementer lane again in the same tree, with
+the failing output or the ticked findings handed to it as untrusted data — it
+still never sees the tests. Every run leaves its full evidence trail in
+`.guvnor/runs/<id>/`.
 
 One sample per role, run sequentially — there is no best-of-N. The
 cross-checking comes from splitting *roles* (the test-writer and the
 implementer never see each other's work) and from the tier split
-(`model_reviewer` above `model_worker`), not from racing candidates. The fix
-round and the rework loop are the same lane trying again with evidence, never
-a contest between parallel attempts.
+(`model_reviewer` above `model_worker`), not from racing candidates.
 
 ## Where the design comes from
 
