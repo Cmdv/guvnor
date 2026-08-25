@@ -337,7 +337,9 @@ impl App {
             let staged = self.runs.iter().any(|r| r.id == *id && r.status == state::Status::Staged);
             let want = (title.chars().count() as u16 + 16)
                 .max(if staged { warn.chars().count() as u16 + 2 } else { 0 });
-            let w = want.clamp(38, area.width);
+            // A terminal narrower than the 38-column floor gives up the floor,
+            // not the frame: `clamp` asserts min <= max and would panic.
+            let w = want.clamp(38.min(area.width), area.width);
             let [pc] = Layout::horizontal([Constraint::Length(w)]).flex(Flex::Center).areas(area);
             let [popup] = Layout::vertical([Constraint::Length(8)]).flex(Flex::Center).areas(pc);
             // one title only — ratatui stacks `.title()` calls, and modal()
@@ -465,6 +467,32 @@ mod tests {
         for (w, h) in [(120u16, 50u16), (100, 30), (40, 14)] {
             let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
             t.draw(|f| app.render_runs(f, Rect::new(0, 0, w, h))).unwrap();
+        }
+    }
+
+    /// A panic inside `draw` escapes before the terminal is handed back, so a
+    /// narrow window is not a cosmetic problem: it leaves the shell in raw mode.
+    /// The delete popup wants 38 columns and has to cope with fewer.
+    #[test]
+    fn the_delete_popup_survives_a_terminal_narrower_than_it_wants() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut app = App::for_test();
+        app.runs = vec![RunRow {
+            id: "id-1".into(),
+            title: "a title long enough to want more room than this".into(),
+            status: state::Status::Staged,
+            verdict: String::new(),
+            cost: String::new(),
+            gates: gates_line(&crate::state::Gates::default()),
+        }];
+        app.table.select(Some(0));
+        app.handle_key(&press(KeyCode::Char('d')));
+        assert!(app.confirm_delete.is_some());
+        // the whole dispatch, so the popup gets the inner rect it gets for real
+        for w in [10u16, 20, 39, 40, 120] {
+            let mut t = Terminal::new(TestBackend::new(w, 20)).unwrap();
+            t.draw(|f| app.render(f)).unwrap();
         }
     }
 

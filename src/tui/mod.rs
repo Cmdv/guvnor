@@ -53,6 +53,7 @@ pub fn run(verbose: bool) -> Result<i32> {
     // Uninitialised repos still get the TUI: init happens in-app (i on home).
     let repo = config::find_repo_root().or_else(|_| config::find_git_root())?;
     let mut app = App::new(repo, verbose);
+    hand_back_on_panic();
     let mut terminal = enter();
     let res = app.event_loop(&mut terminal);
     leave();
@@ -60,18 +61,41 @@ pub fn run(verbose: bool) -> Result<i32> {
     Ok(0)
 }
 
+/// Give the terminal back if the thread that owns the screen dies. Only that
+/// thread: an engine job panicking is caught by `pump` and reported as a failed
+/// job, so tearing the screen down there would leave the UI drawing into the
+/// live shell. Installed once, before the first `enter`, so the `$EDITOR` round
+/// trip does not stack a hook per visit.
+fn hand_back_on_panic() {
+    let ui = std::thread::current().id();
+    let next = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().id() == ui {
+            leave();
+        }
+        next(info);
+    }));
+}
+
 /// Take the terminal, and ask for the kitty keyboard protocol while we have it:
 /// without it ⇧↵ arrives as a plain ↵, and in a box where ↵ submits there is
 /// then no way to type a newline at all. Best effort — a terminal that doesn't
 /// understand the escape ignores it, and alt+↵ still works there.
+///
+/// Spelled out rather than `ratatui::init`, whose panic hook fires on every
+/// thread and does not know about the keyboard flags. `hand_back_on_panic` owns
+/// that job.
 fn enter() -> DefaultTerminal {
     use ratatui::crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
-    let t = ratatui::init();
+    use ratatui::crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
+    enable_raw_mode().expect("enable raw mode");
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
+        EnterAlternateScreen,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     );
-    t
+    ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
+        .expect("terminal")
 }
 
 /// Give it back. Paired with `enter`, because the keyboard flags outlive the
