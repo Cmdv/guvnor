@@ -5,7 +5,7 @@ use std::process::Command;
 pub struct TestOutcome {
     pub green: bool,
     pub exit_code: Option<i32>,
-    /// Last lines of combined output — the evidence a human sees at G2/G3.
+    /// Last lines of combined output — the evidence a human sees in the case file.
     pub tail: String,
 }
 

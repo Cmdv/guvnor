@@ -2,12 +2,39 @@ use crate::digest::git;
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
-/// Lane worktrees live OUTSIDE the repo (sibling dir) so test runners with
-/// auto-discovery never see them — spike finding: `node --test` picked up
-/// fixture files inside the tree.
+/// Lane worktrees live under `.guvnor/wt/` — inside the repo dir but kept out
+/// of the tracked tree via `.git/info/exclude` (see `ensure_wt_ignored`), so
+/// nothing is created outside the repo. The old spike worry (a `node --test`
+/// picking up sibling fixtures) doesn't apply: each lane runs tests with cwd =
+/// its OWN worktree, never an ancestor of another, and a worktree checkout has
+/// no nested `wt/` (it's git-excluded, so never in HEAD).
 pub fn wt_container(repo: &Path) -> PathBuf {
-    let name = repo.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    repo.parent().unwrap_or(repo).join(format!("{name}-gaffer-wt"))
+    repo.join(".guvnor/wt")
+}
+
+/// Exclude the worktree container from git locally. It's per-developer
+/// throwaway state; a *tracked* .gitignore edit would dirty the tree and trip
+/// the merge clean-tree check, so we write `$GIT_DIR/info/exclude` instead
+/// (local, uncommitted). Idempotent — safe to call every run.
+pub fn ensure_wt_ignored(repo: &Path) -> Result<()> {
+    const ENTRY: &str = ".guvnor/wt/";
+    let rel = git(repo, &["rev-parse", "--git-path", "info/exclude"])?;
+    let path = repo.join(rel.trim());
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    if existing.lines().any(|l| l.trim() == ENTRY) {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut content = existing;
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(ENTRY);
+    content.push('\n');
+    std::fs::write(&path, content)?;
+    Ok(())
 }
 
 pub fn create(repo: &Path, run_id: &str, lane: &str) -> Result<PathBuf> {
@@ -33,8 +60,44 @@ pub fn remove(repo: &Path, dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The lanes that own a worktree. Also the closed set `remove_run` matches on:
+/// a bare `<run_id>-` prefix would also match a longer run id that starts with
+/// this one (same-second ids whose slugs nest, e.g. `add` and `add-more`) and
+/// delete another run's live tree.
+const LANES: [&str; 3] = ["tests", "impl", "verif"];
+
+/// Is `name` a worktree dir belonging to `run_id`?
+pub fn is_run_wt(name: &str, run_id: &str) -> bool {
+    name.strip_prefix(run_id)
+        .and_then(|r| r.strip_prefix('-'))
+        .is_some_and(|lane| LANES.contains(&lane))
+}
+
+/// Remove every lane worktree belonging to a run. Used on success so callers
+/// don't have to track which trees they created — a fix round creates a
+/// different set than the initial run.
+pub fn remove_run(repo: &Path, run_id: &str) -> Result<()> {
+    if let Ok(entries) = std::fs::read_dir(wt_container(repo)) {
+        for e in entries.flatten() {
+            if is_run_wt(&e.file_name().to_string_lossy(), run_id) {
+                remove(repo, &e.path())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reset a worktree to pristine HEAD (rework rounds re-apply patches from
+/// scratch: cumulative patches don't stack on an already-patched tree).
+pub fn reset_hard(wt: &Path) -> Result<()> {
+    git(wt, &["reset", "--hard", "HEAD"])?;
+    // -e .claude: keep guvnor's own hook scaffolding written by write_settings
+    git(wt, &["clean", "-fd", "-e", ".claude"])?;
+    Ok(())
+}
+
 /// Capture everything a lane did as one patch (staged snapshot of the
-/// worktree, including new files). Excludes .claude/ — that's gaffer's own
+/// worktree, including new files). Excludes .claude/ — that's guvnor's own
 /// hook scaffolding, not lane work.
 pub fn capture_patch(wt: &Path) -> Result<String> {
     git(wt, &["add", "-A", "--", ".", ":(exclude).claude"])?;
@@ -45,9 +108,16 @@ pub fn apply_patch(wt: &Path, patch: &str) -> Result<()> {
     apply_args(wt, patch, &["apply", "--whitespace=nowarn"])
 }
 
-/// Apply to index+tree in the MAIN repo (merge step): leaves changes staged.
+/// Apply to index+tree in the MAIN repo (the commit step): leaves it staged.
 pub fn apply_patch_staged(repo: &Path, patch: &str) -> Result<()> {
     apply_args(repo, patch, &["apply", "--index", "--whitespace=nowarn"])
+}
+
+/// Take it back out again (`unstage`). `-R` also removes files the patch
+/// created, from the index and from disk — verified, so there is no `git rm`
+/// half to forget.
+pub fn reverse_patch_staged(repo: &Path, patch: &str) -> Result<()> {
+    apply_args(repo, patch, &["apply", "-R", "--index", "--whitespace=nowarn"])
 }
 
 fn apply_args(dir: &Path, patch: &str, args: &[&str]) -> Result<()> {
@@ -87,14 +157,26 @@ pub fn patch_paths(patch: &str) -> Vec<String> {
     paths
 }
 
-pub fn validate_patch_within(patch: &str, prefixes: &[String], label: &str) -> Result<()> {
+/// Server-side re-validation of a lane's patch. The hook is the first line of
+/// defence; this is the backstop that doesn't trust the lane's environment at
+/// all. Lanes may touch the whole repo, so all this enforces is: there IS work,
+/// and it stays off guvnor's own control surfaces.
+/// Paths that both patches touch. Applying both to one tree would collide
+/// (`already exists in working directory`), so an overlap must be caught as a
+/// gate failure before `git apply` turns it into a raw error.
+pub fn overlapping_paths(first: &str, second: &str) -> Vec<String> {
+    let a = patch_paths(first);
+    patch_paths(second).into_iter().filter(|p| a.contains(p)).collect()
+}
+
+pub fn validate_patch(patch: &str, label: &str) -> Result<()> {
     let paths = patch_paths(patch);
     if paths.is_empty() {
         bail!("{label} patch is empty — lane produced no work");
     }
     for p in &paths {
-        if !prefixes.iter().any(|pre| p.starts_with(pre.as_str())) {
-            bail!("{label} patch touches forbidden path '{p}' (allowed: {prefixes:?})");
+        if let Some(d) = crate::hookguard::denied_prefix(p) {
+            bail!("{label} patch touches guvnor's control surface '{p}' ({d})");
         }
     }
     Ok(())
@@ -112,11 +194,61 @@ mod tests {
     }
 
     #[test]
-    fn validates_prefixes() {
-        let tests_only = vec!["test/".to_string()];
-        assert!(validate_patch_within(PATCH, &tests_only, "tests").is_err());
-        let both = vec!["test/".to_string(), "src/".to_string()];
-        assert!(validate_patch_within(PATCH, &both, "tests").is_ok());
-        assert!(validate_patch_within("", &both, "tests").is_err());
+    fn ensure_wt_ignored_excludes_container_and_keeps_tree_clean() {
+        let dir = std::env::temp_dir().join(format!("guvnor-wtignore-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]).unwrap();
+        std::fs::write(dir.join("f"), "x").unwrap();
+        git(&dir, &["add", "-A"]).unwrap();
+        git(&dir, &["commit", "-qm", "init"]).unwrap();
+        ensure_wt_ignored(&dir).unwrap();
+        ensure_wt_ignored(&dir).unwrap(); // idempotent — no duplicate line
+        let excl = std::fs::read_to_string(dir.join(".git/info/exclude")).unwrap();
+        assert_eq!(excl.matches(".guvnor/wt/").count(), 1);
+        // a worktree inside the ignored container leaves the main tree clean
+        // (the property the merge clean-tree check depends on)
+        let wt = wt_container(&dir).join("probe");
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        git(&dir, &["worktree", "add", "--detach", wt.to_str().unwrap(), "HEAD"]).unwrap();
+        let status = git(&dir, &["status", "--porcelain"]).unwrap();
+        assert!(status.trim().is_empty(), "tree not clean: {status:?}");
+        git(&dir, &["worktree", "remove", "--force", wt.to_str().unwrap()]).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_wt_match_does_not_leak_into_a_nested_run_id() {
+        assert!(is_run_wt("r1-tests", "r1"));
+        assert!(is_run_wt("r1-impl", "r1"));
+        assert!(is_run_wt("r1-verif", "r1"));
+        // the footgun: a longer run id starting with this one must not match,
+        // or cleaning `r1` would delete `r1-more`'s live worktrees
+        assert!(!is_run_wt("r1-more-tests", "r1"));
+        assert!(is_run_wt("r1-more-tests", "r1-more"));
+        assert!(!is_run_wt("r1-tests", "r2"));
+        assert!(!is_run_wt("r1-scratch", "r1"));
+    }
+
+    #[test]
+    fn finds_overlapping_paths() {
+        let tests = "diff --git a/test/A.hs b/test/A.hs\n--- a/x\n+++ b/x\n@@\n+x\n";
+        let impl_clean = "diff --git a/src/B.hs b/src/B.hs\n--- a/x\n+++ b/x\n@@\n+y\n";
+        assert!(overlapping_paths(tests, impl_clean).is_empty());
+        // the real failure: impl re-creates a file tests.patch already owns
+        assert_eq!(overlapping_paths(tests, PATCH), vec!["test/A.hs".to_string()]);
+    }
+
+    #[test]
+    fn validates_patch_scope() {
+        // whole-repo policy: a patch spanning test/ and src/ is fine
+        assert!(validate_patch(PATCH, "tests").is_ok());
+        // no work at all is still a failure
+        assert!(validate_patch("", "tests").is_err());
+        // guvnor's own control surfaces stay off-limits
+        let evil = "diff --git a/.claude/settings.json b/.claude/settings.json\n--- a/.claude/settings.json\n+++ b/.claude/settings.json\n@@\n+{}\n";
+        assert!(validate_patch(evil, "impl").is_err());
+        let tamper = "diff --git a/.guvnor/runs/x/state.json b/.guvnor/runs/x/state.json\n--- a/x\n+++ b/x\n@@\n+{}\n";
+        assert!(validate_patch(tamper, "impl").is_err());
     }
 }

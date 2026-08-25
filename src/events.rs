@@ -71,7 +71,7 @@ mod tests {
 
     #[test]
     fn append_writes_ndjson_lines() {
-        let dir = std::env::temp_dir().join(format!("gaffer-ev-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("guvnor-ev-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let log = EventLog::new(&dir);
         log.append("a", json!({"x": 1})).unwrap();

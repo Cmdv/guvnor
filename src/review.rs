@@ -1,10 +1,56 @@
 use crate::spec::extract_json_object;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+/// The reviewer's decision — a closed set the type now enforces (serde rejects
+/// anything else at parse time, so no hand-rolled string validation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum Decision {
+    Approved,
+    Warning,
+    Blocked,
+}
+
+impl std::fmt::Display for Decision {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        // `pad`, not `write_str`: `write_str` bypasses the formatter and silently
+        // ignores width, so `{:<7}` on one of these produced `lowsrc/numeric.js`
+        // in the findings list.
+        f.pad(match self {
+            Decision::Approved => "APPROVED",
+            Decision::Warning => "WARNING",
+            Decision::Blocked => "BLOCKED",
+        })
+    }
+}
+
+/// Finding severity — LLM-emitted, so an off-set value degrades to `Unknown`
+/// rather than failing the whole review parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    High,
+    Medium,
+    Low,
+    #[serde(other)]
+    Unknown,
+}
+
+impl std::fmt::Display for Severity {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.pad(match self {
+            Severity::High => "high",
+            Severity::Medium => "medium",
+            Severity::Low => "low",
+            Severity::Unknown => "unknown",
+        })
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
-    pub severity: String,
+    pub severity: Severity,
     #[serde(default)]
     pub file: String,
     pub note: String,
@@ -12,7 +58,7 @@ pub struct Finding {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Verdict {
-    pub verdict: String,
+    pub verdict: Decision,
     #[serde(default)]
     pub summary: String,
     #[serde(default)]
@@ -35,11 +81,8 @@ pub struct Review {
 pub fn parse_verdict(result_text: &str) -> Result<Verdict> {
     let json = extract_json_object(result_text)
         .context("reviewer output contains no JSON object")?;
-    let v: Verdict = serde_json::from_str(json).context("verdict JSON shape invalid")?;
-    match v.verdict.as_str() {
-        "APPROVED" | "WARNING" | "BLOCKED" => Ok(v),
-        other => bail!("verdict must be APPROVED|WARNING|BLOCKED, got '{other}'"),
-    }
+    // serde enforces the APPROVED|WARNING|BLOCKED set via the Decision enum.
+    serde_json::from_str(json).context("verdict JSON invalid (need APPROVED|WARNING|BLOCKED)")
 }
 
 #[cfg(test)]
@@ -51,8 +94,15 @@ mod tests {
         let text = r#"Here is my review:
 {"verdict": "APPROVED", "summary": "ok", "findings": [{"severity": "low", "file": "src/a.rs", "note": "n"}]}"#;
         let v = parse_verdict(text).unwrap();
-        assert_eq!(v.verdict, "APPROVED");
+        assert_eq!(v.verdict, Decision::Approved);
         assert_eq!(v.findings.len(), 1);
+    }
+
+    #[test]
+    fn severity_offset_degrades_to_unknown() {
+        let f: Finding =
+            serde_json::from_str(r#"{"severity":"critical","note":"n"}"#).unwrap();
+        assert_eq!(f.severity, Severity::Unknown);
     }
 
     #[test]

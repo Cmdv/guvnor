@@ -1,0 +1,258 @@
+//! The spec as boxes, and the popup that iterates it.
+//!
+//! There is no spec *screen* any more: a run has one screen, and the spec is
+//! its first tab. Everything here is drawn by `case.rs` — the panels on the
+//! Spec tab, the `Prompt` when you press `i`.
+
+use crate::spec::Spec;
+use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Padding, Paragraph};
+use ratatui::Frame;
+
+use super::*;
+
+/// Multiline prompt + action row (spec feedback). Tab moves between the text
+/// and the row; ↵ in the text is a newline, ↵ on the row acts.
+pub struct Prompt {
+    pub text: TextArea,
+    pub buttons: Buttons,
+    pub on_buttons: bool,
+}
+
+impl Default for Prompt {
+    fn default() -> Self {
+        Self {
+            text: TextArea::default(),
+            buttons: Buttons::new(&["send", "cancel"], YES_NO),
+            on_buttons: false,
+        }
+    }
+}
+
+/// Cursor and scroll offsets for the spec's six boxes. Every box is always on
+/// screen; the one with the cursor is the one the arrows scroll, and its number
+/// gets you there directly — that is how content taller than its box is read,
+/// rather than by making the box taller than the screen.
+#[derive(Default)]
+pub struct SpecPanels {
+    pub focus: usize,
+    pub scrolls: [Scroll; 6],
+}
+
+impl SpecPanels {
+    /// `1`-`6` jump, arrows scroll the box they land on. Returns whether the key
+    /// was ours, so the caller can pass on the ones that aren't.
+    pub fn handle(&mut self, key: &KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Char(c @ '1'..='6') => {
+                self.focus = c as usize - '1' as usize;
+                true
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.scrolls[self.focus].by(1);
+                true
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.scrolls[self.focus].by(-1);
+                true
+            }
+            KeyCode::PageDown => {
+                self.scrolls[self.focus].by(10);
+                true
+            }
+            KeyCode::PageUp => {
+                self.scrolls[self.focus].by(-10);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Which sections share a row. Two columns while there is room for them, one
+/// when there isn't — the boxes survive the resize either way, because losing
+/// them turned the spec back into the wall of text they exist to break up.
+///
+/// Wide (owner): objective │ files · interfaces │ constraints, then verification
+/// and the acceptance criteria on the full width. Those two are what the run is
+/// judged against — one is the command that decides it, the other the numbered
+/// sentences the reviewer scores — so neither gets squeezed into half a screen.
+pub fn panel_rows(width: u16) -> Vec<Vec<usize>> {
+    if width >= 88 {
+        vec![vec![0, 1], vec![2, 3], vec![4], vec![5]]
+    } else {
+        (0..6).map(|i| vec![i]).collect()
+    }
+}
+
+/// The spec as boxes. Every box is drawn, always: heights are shared out in
+/// proportion to what each section needs, so nothing is hidden and no space is
+/// wasted, and anything that still doesn't fit is scrolled inside its own box.
+pub fn render_spec_panels(f: &mut Frame, area: Rect, sp: &Spec, p: &SpecPanels) {
+    let s = spec_sections(sp);
+    let rows = panel_rows(area.width);
+    // Height each row would like: the tallest of its boxes, wrapped at the width
+    // it will actually get. 2 border rows + 2 padding columns per box.
+    let cell_w = area.width / rows.iter().map(|r| r.len()).max().unwrap_or(1) as u16;
+    let need = |i: usize| {
+        hang_wrap_all(&s[i].body, cell_w.saturating_sub(4).max(1) as usize).len() as u16 + 2
+    };
+    let mut weights: Vec<u16> =
+        rows.iter().map(|r| r.iter().map(|&i| need(i)).max().unwrap_or(3).max(3)).collect();
+    // The objective is the first thing anyone reads and it is prose, so give its
+    // row a floor instead of only what its own line count asks for. Fill is
+    // proportional, so the room comes off the tallest row — which is the
+    // criteria list, capped here for the same reason. Neither hides anything:
+    // every box has its own number and its own scroll.
+    // ponytail: two constants, tuned by eye. A per-section weight table is the
+    // upgrade if the spec ever grows a section that wants its own rule.
+    if let Some(w) = weights.first_mut() {
+        *w = (*w).max(10);
+    }
+    if let Some(w) = weights.last_mut() {
+        *w = (*w).min(6);
+    }
+    // Fill, not Length: when it all fits the boxes grow into the space instead
+    // of leaving a gap at the bottom, and when it doesn't they shrink in
+    // proportion rather than one of them disappearing.
+    let areas = Layout::vertical(weights.iter().map(|w| Constraint::Fill(*w))).split(area);
+
+    for (row, row_area) in rows.iter().zip(areas.iter()) {
+        let cols = Layout::horizontal(vec![Constraint::Ratio(1, row.len() as u32); row.len()])
+            .split(*row_area);
+        for (&i, cell) in row.iter().zip(cols.iter()) {
+            let focused = i == p.focus;
+            let (border, text) = if focused {
+                (Color::White, Style::new().fg(Color::White).bold())
+            } else {
+                (MODAL_BORDER, Style::new().fg(Color::Cyan).bold())
+            };
+            // The number is the key that gets you here, so it is red like every
+            // other "press this" in the app; the brackets track the border, so a
+            // focused panel lights them white too.
+            let chrome = Style::new().fg(border);
+            let title = Line::from(vec![
+                Span::styled("─┐ ", chrome),
+                Span::styled(format!("{}", i + 1), Style::new().fg(Color::Red).bold()),
+                Span::styled(format!(" {} ", s[i].title), text),
+                Span::styled(if focused { "↑↓ ┌" } else { "┌" }, chrome),
+            ]);
+            let block = boxed("", Style::new())
+                .title(title)
+                .border_style(Style::new().fg(border))
+                .padding(Padding::horizontal(1));
+            let inner = block.inner(*cell);
+            let wrapped = hang_wrap_all(&s[i].body, inner.width.max(1) as usize);
+            let off = p.scrolls[i].fit(wrapped.len(), inner.height);
+            f.render_widget(Paragraph::new(wrapped).scroll((off, 0)).block(block), *cell);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn spec() -> Spec {
+        Spec {
+            title: "t".into(),
+            objective: "make it work".into(),
+            files: vec!["src/a.js (new): the thing".into()],
+            interfaces: vec!["src/a.js: function f(x) — does x".into()],
+            constraints: vec!["no deps".into(), "no globals".into()],
+            verification: "node --test".into(),
+            acceptance_criteria: vec!["works".into(), "still works".into()],
+        }
+    }
+
+    fn screen_of(w: u16, h: u16, p: &SpecPanels, sp: &Spec) -> String {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| render_spec_panels(f, Rect::new(0, 0, w, h), sp, p)).unwrap();
+        let b = t.backend().buffer();
+        (0..h)
+            .map(|y| (0..w).map(|x| b[(x, y)].symbol().to_string()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn screen(w: u16, h: u16, p: &SpecPanels) -> String {
+        screen_of(w, h, p, &spec())
+    }
+
+    /// Every section keeps its box at every size. It used to collapse to one
+    /// column of text below a threshold, which is the wall of text the boxes
+    /// exist to break up.
+    #[test]
+    fn every_section_keeps_its_box_at_any_size() {
+        let p = SpecPanels::default();
+        for (w, h) in [(120, 30), (120, 14), (70, 40), (60, 20)] {
+            let text = screen(w, h, &p);
+            for (n, s) in spec_sections(&spec()).iter().enumerate() {
+                // the number is the key that jumps here, so it is part of the title
+                let label = format!("{} {}", n + 1, s.title);
+                assert!(text.contains(&label), "no box for {label} at {w}x{h}:\n{text}");
+            }
+        }
+        // two columns while there's room, one when there isn't — and the two
+        // things the run is judged by keep the full width
+        assert_eq!(panel_rows(120), [vec![0, 1], vec![2, 3], vec![4], vec![5]]);
+        assert_eq!(panel_rows(70).len(), 6, "narrow stacks them, it does not drop them");
+    }
+
+    /// The objective is what you read first, so it is not allowed to be the
+    /// smallest box on screen just because it is three sentences and the
+    /// criteria list is fifteen bullets. The room comes off the criteria, which
+    /// scroll (6, then ↑↓).
+    #[test]
+    fn the_objective_gets_room_and_a_long_criteria_list_does_not_take_it() {
+        let mut sp = spec();
+        sp.acceptance_criteria = (1..=15).map(|n| format!("criterion number {n}")).collect();
+        let (w, h) = (120, 40);
+        let text = screen_of(w, h, &SpecPanels::default(), &sp);
+        let row = |label: &str| text.lines().position(|l| l.contains(label)).unwrap();
+        // rows: objective│files · interfaces│constraints · verification · criteria
+        let objective = row("3 Interfaces") - row("1 Objective");
+        let criteria = h as usize - row("6 Acceptance criteria");
+        assert!(
+            objective > criteria,
+            "objective {objective} rows vs criteria {criteria} — the box everyone reads lost:\n{text}"
+        );
+        // ...and the criteria still get more than a sliver: capped, not starved
+        assert!(criteria >= 8, "criteria squeezed to {criteria} rows:\n{text}");
+    }
+
+    /// The boxes are how tall the screen allows, so content taller than that has
+    /// to be reachable: a number gets you to the box, the arrows scroll it.
+    #[test]
+    fn a_number_picks_a_box_and_the_arrows_scroll_that_one() {
+        let mut p = SpecPanels::default();
+        assert!(p.handle(&press(KeyCode::Char('4'))));
+        assert_eq!(p.focus, 3);
+        // the focused box advertises the arrows; the others don't
+        let text = screen(120, 30, &p);
+        assert!(text.contains("4 Constraints (2) ↑↓"), "{text}");
+        assert!(!text.contains("1 Objective ↑↓"));
+
+        // arrows move that box's offset and no other
+        p.scrolls[3].max.set(9);
+        assert!(p.handle(&press(KeyCode::Down)));
+        assert_eq!(p.scrolls[3].off, 1);
+        assert!(p.scrolls.iter().enumerate().all(|(i, s)| i == 3 || s.off == 0));
+        // ...and clamped by the same `Scroll` contract as everywhere else
+        for _ in 0..50 {
+            p.handle(&press(KeyCode::Down));
+        }
+        assert_eq!(p.scrolls[3].off, 9);
+        // keys that aren't ours are handed back: `7` is not a box, `e` is edit
+        for c in ['7', '0', 'e'] {
+            assert!(!p.handle(&press(KeyCode::Char(c))), "{c} must pass through");
+        }
+    }
+}
+
+
