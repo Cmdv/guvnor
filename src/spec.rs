@@ -65,25 +65,16 @@ impl Spec {
     }
 }
 
-/// Extract the first JSON object from model output text (models wrap JSON in
-/// prose/fences despite instructions). Scans for balanced braces from each
-/// '{' and returns the first slice that parses.
-pub fn extract_json_object(text: &str) -> Option<&str> {
-    let bytes = text.as_bytes();
-    let mut start = None;
+/// Index of the `}` closing the object that starts at `start`, if it closes.
+/// Braces inside string literals do not count, and `\"` inside one does not end
+/// it. `depth` cannot underflow: the caller only passes a `{`, which takes it to
+/// 1 before any `}` is reached. Both braces are ASCII, so every index the caller
+/// slices at is a char boundary.
+fn balanced_end(bytes: &[u8], start: usize) -> Option<usize> {
     let mut depth = 0usize;
     let mut in_str = false;
     let mut esc = false;
-    for (i, &b) in bytes.iter().enumerate() {
-        if start.is_none() {
-            if b == b'{' {
-                start = Some(i);
-                depth = 1;
-                in_str = false;
-                esc = false;
-            }
-            continue;
-        }
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
         if esc {
             esc = false;
             continue;
@@ -95,17 +86,33 @@ pub fn extract_json_object(text: &str) -> Option<&str> {
             b'}' if !in_str => {
                 depth -= 1;
                 if depth == 0 {
-                    let s = &text[start.unwrap()..=i];
-                    if serde_json::from_str::<serde_json::Value>(s).is_ok() {
-                        return Some(s);
-                    }
-                    start = None; // keep scanning past a non-JSON brace blob
+                    return Some(i);
                 }
             }
             _ => {}
         }
     }
     None
+}
+
+/// Every JSON object in model output, in the order they appear. Models wrap
+/// JSON in prose and fences despite instructions, and the reviewer's job is
+/// reading diffs, which routinely contain JSON of their own, so the caller
+/// takes the first that deserialises into the type it wants rather than
+/// trusting the first that is merely valid.
+///
+/// Every `{` is a candidate, including one that never closes: an unmatched
+/// brace in a prose snippet would otherwise swallow every object after it.
+///
+/// ponytail: O(n^2) on text that is mostly braces, which model replies are not.
+/// If that ever bites, remember the end of the last yielded object and skip past
+/// candidates inside it.
+pub fn json_objects(text: &str) -> impl Iterator<Item = &str> {
+    let bytes = text.as_bytes();
+    (0..bytes.len())
+        .filter(move |&i| bytes[i] == b'{')
+        .filter_map(move |i| balanced_end(bytes, i).map(|end| &text[i..=end]))
+        .filter(|s| serde_json::from_str::<serde_json::Value>(s).is_ok())
 }
 
 #[cfg(test)]
@@ -142,7 +149,7 @@ mod tests {
     #[test]
     fn extract_json_from_prose_and_fences() {
         let t = "Sure! Here you go:\n```json\n{\"a\": {\"b\": 1}, \"s\": \"x } y\"}\n```\nDone.";
-        let j = extract_json_object(t).unwrap();
+        let j = json_objects(t).next().unwrap();
         let v: serde_json::Value = serde_json::from_str(j).unwrap();
         assert_eq!(v["a"]["b"], 1);
     }
@@ -150,12 +157,12 @@ mod tests {
     #[test]
     fn extract_skips_non_json_braces() {
         let t = "code { not json } then {\"ok\": true}";
-        let j = extract_json_object(t).unwrap();
+        let j = json_objects(t).next().unwrap();
         assert_eq!(j, "{\"ok\": true}");
     }
 
     #[test]
     fn extract_none_when_absent() {
-        assert!(extract_json_object("no braces here").is_none());
+        assert_eq!(json_objects("no braces here").count(), 0);
     }
 }

@@ -1,4 +1,3 @@
-use crate::spec::extract_json_object;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -53,6 +52,7 @@ pub struct Finding {
     pub severity: Severity,
     #[serde(default)]
     pub file: String,
+    #[serde(default)]
     pub note: String,
 }
 
@@ -77,10 +77,14 @@ pub struct Review {
     pub ts: String,
 }
 
+/// The first JSON object in the reviewer's reply that is a verdict. Not the
+/// first that is valid JSON: the reviewer is handed a diff to read, and a diff
+/// that adds a JSON fixture would otherwise supply the object guvnor parses,
+/// failing the run and throwing away three lanes' worth of tokens.
 pub fn parse_verdict(result_text: &str) -> Result<Verdict> {
-    let json = extract_json_object(result_text)
-        .context("reviewer output contains no JSON object")?;
-    serde_json::from_str(json).context("verdict JSON invalid (need APPROVED|WARNING|BLOCKED)")
+    crate::spec::json_objects(result_text)
+        .find_map(|s| serde_json::from_str::<Verdict>(s).ok())
+        .context("reviewer output contains no verdict object (need APPROVED|WARNING|BLOCKED)")
 }
 
 #[cfg(test)]
@@ -107,5 +111,38 @@ mod tests {
     fn rejects_bad_enum_and_missing_json() {
         assert!(parse_verdict(r#"{"verdict": "LGTM"}"#).is_err());
         assert!(parse_verdict("no json at all").is_err());
+    }
+
+    /// The reviewer is handed a diff to read, so other people's JSON turns up in
+    /// its reply. Taking the first object that is merely valid hands back a
+    /// fixture instead of the verdict, and the run dies as review_unparseable
+    /// with three lanes already paid for.
+    #[test]
+    fn a_json_fixture_in_the_diff_is_not_mistaken_for_the_verdict() {
+        let text = r#"The diff adds a fixture:
+    +{"name": "widget", "qty": 2}
+and a config block `{"debug": true}`. My assessment:
+{"verdict": "WARNING", "summary": "s", "findings": []}"#;
+        let v = parse_verdict(text).unwrap();
+        assert_eq!(v.verdict, Decision::Warning);
+        assert_eq!(v.summary, "s");
+    }
+
+    /// An unmatched brace in a prose snippet must not swallow the answer after
+    /// it. Scanning restarts one byte in, so the run below still finds it.
+    #[test]
+    fn an_unclosed_brace_before_the_verdict_is_stepped_over() {
+        let text = "I looked at `fn main() {` and the guard `if x {`.\n\
+                    {\"verdict\": \"APPROVED\", \"summary\": \"ok\"}";
+        assert_eq!(parse_verdict(text).unwrap().verdict, Decision::Approved);
+    }
+
+    /// A finding with no `note` must not fail the whole review, same as `file`:
+    /// both are fields a model fills in.
+    #[test]
+    fn a_finding_missing_its_note_still_parses() {
+        let f: Finding = serde_json::from_str(r#"{"severity":"low","file":"a.rs"}"#).unwrap();
+        assert_eq!(f.severity, Severity::Low);
+        assert!(f.note.is_empty());
     }
 }

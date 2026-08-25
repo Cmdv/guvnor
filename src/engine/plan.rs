@@ -1,11 +1,13 @@
 use super::*;
 use std::io::Read;
 
-/// Extract + validate the spec JSON a planner lane returned.
+/// Extract + validate the spec JSON a planner lane returned. The first object
+/// that is a spec, not the first that is valid JSON, so a snippet in the
+/// planner's prose cannot stand in for its answer.
 fn parse_planner_spec(result_text: &str, default_verification: &str) -> Result<Spec> {
-    let json_str =
-        spec::extract_json_object(result_text).context("planner returned no JSON spec")?;
-    let mut sp: Spec = serde_json::from_str(json_str).context("planner spec JSON invalid")?;
+    let mut sp: Spec = spec::json_objects(result_text)
+        .find_map(|s| serde_json::from_str::<Spec>(s).ok())
+        .context("planner returned no JSON spec")?;
     if sp.verification.trim().is_empty() {
         sp.verification = default_verification.into();
     }

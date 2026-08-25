@@ -21,9 +21,11 @@ pub struct Commands {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Paths {
-    /// Repo-relative prefixes the test-writer may write under.
+    /// Repo-relative prefixes named to the test-writer in its prompt. Guidance,
+    /// not a fence: the hooks deny guvnor's own control files and nothing else,
+    /// so a lane can write anywhere in its worktree.
     pub tests: Vec<String>,
-    /// Repo-relative prefixes the implementer may write under.
+    /// Same, for the implementer.
     pub src: Vec<String>,
 }
 
@@ -82,6 +84,12 @@ fn validate_prefixes(ps: &[String]) -> Result<()> {
         if p.starts_with('/') || p.contains("..") {
             bail!("path prefix must be repo-relative without '..': {p}");
         }
+        // These go into a lane's prompt as where to put its work, and the hooks
+        // deny every write under them, so accepting one guarantees a lane that
+        // follows instructions gets blocked for it.
+        if let Some(d) = crate::hookguard::denied_prefix(p) {
+            bail!("'{p}' is guvnor's own control surface ({d}); lanes cannot write there");
+        }
     }
     Ok(())
 }
@@ -121,8 +129,13 @@ pub fn init_repo_with(dir: &Path, test: &str, tests: &[&str], src: &[&str]) -> R
     let guvnor_dir = dir.join(".guvnor");
     std::fs::create_dir_all(guvnor_dir.join("runs"))?;
     // Run artifacts are local evidence, not repo content; without this the
-    // stage clean-tree check trips over guvnor's own files.
-    std::fs::write(guvnor_dir.join(".gitignore"), "runs/\n")?;
+    // stage clean-tree check trips over guvnor's own files. Written once and
+    // then left alone, like the config beside it: every settings save came
+    // through here, so anything a developer added was being clobbered.
+    let ignore = guvnor_dir.join(".gitignore");
+    if !ignore.exists() {
+        std::fs::write(&ignore, "runs/\n")?;
+    }
     let cfg = guvnor_dir.join("guvnor.toml");
     if !cfg.exists() {
         // A template that doesn't parse is unrecoverable in-app: `save_settings`
@@ -177,7 +190,12 @@ pub fn save_settings(repo: &Path, s: &Settings) -> Result<PathBuf> {
     doc["claude"]["model_reviewer"] = toml_edit::value(s.models[2].as_str());
     doc["limits"]["lane_timeout_secs"] = toml_edit::value(s.timeout_secs as i64);
     doc["limits"]["max_rework_rounds"] = toml_edit::value(s.max_rework_rounds as i64);
-    std::fs::write(&path, doc.to_string())?;
+    // Write then rename: a truncating write interrupted halfway leaves a
+    // guvnor.toml that `Config::load` rejects, and there is no key in the TUI
+    // that opens it to fix by hand.
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, doc.to_string())?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("cannot replace {}", path.display()))?;
     Ok(path)
 }
 

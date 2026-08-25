@@ -25,7 +25,9 @@ impl EventLog {
             .create(true)
             .append(true)
             .open(&self.path)?;
-        writeln!(f, "{line}")?;
+        // One write, not writeln!'s two: under O_APPEND a single write cannot
+        // interleave with another process's, and this log is the audit trail.
+        f.write_all(format!("{line}\n").as_bytes())?;
         Ok(())
     }
 }
@@ -34,7 +36,8 @@ pub fn now_iso() -> String {
     // Epoch-seconds ISO, no chrono dependency. Two events in the same second
     // are still ordered correctly: append order to events.ndjson IS the sort
     // key, so sub-second precision would add nothing.
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    // A clock before 1970 is not worth a panic in the middle of a run.
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let days = secs / 86_400;
     let (y, mo, d) = civil_from_days(days as i64);
     let rem = secs % 86_400;
