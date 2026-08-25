@@ -4,6 +4,7 @@
 
 use anyhow::{Context, Result};
 use serde_json::json;
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -77,18 +78,20 @@ struct ReaderOut {
     cost_usd: f64,
 }
 
-/// Pull result text + usage metrics from a stream-json `result` event.
+/// Pull result text + usage metrics from a stream-json `result` event. Usage
+/// accumulates because the ledger has to total what the lane actually spent; the
+/// text is the final answer, so a later event replaces it.
 fn absorb_result_event(v: &serde_json::Value, out: &mut ReaderOut) {
     if let Some(r) = v["result"].as_str() {
         out.result_text = r.to_string();
     }
     let u = &v["usage"];
-    out.tokens_in = ["input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"]
+    out.tokens_in += ["input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"]
         .iter()
         .map(|k| u[*k].as_u64().unwrap_or(0))
-        .sum();
-    out.tokens_out = u["output_tokens"].as_u64().unwrap_or(0);
-    out.cost_usd = v["total_cost_usd"].as_f64().unwrap_or(0.0);
+        .sum::<u64>();
+    out.tokens_out += u["output_tokens"].as_u64().unwrap_or(0);
+    out.cost_usd += v["total_cost_usd"].as_f64().unwrap_or(0.0);
 }
 
 /// Write per-worktree Claude Code settings wiring PreToolUse hooks to this
@@ -173,25 +176,25 @@ pub fn run(mut spec: LaneSpec) -> Result<LaneResult> {
             cmd.args(["--resume", id]);
         }
     }
-    // Own process group so timeout kill reaps the CLI and its children.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
+    // Own process group, so the timeout kill reaps the CLI and everything it
+    // started. `process_group` reports a failure through `spawn` rather than
+    // leaving the child in guvnor's own group with `pgid` naming nothing, which
+    // is what a hand-rolled setsid in `pre_exec` did when its return went
+    // unchecked: killpg then signalled nothing and both waits below are
+    // unbounded, so the timeout never arrived.
+    cmd.process_group(0);
     let mut child = cmd.spawn().with_context(|| format!("spawn {}", spec.claude_bin))?;
     let pgid = child.id() as i32;
 
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
+    let stdout = child.stdout.take().context("lane stdout")?;
+    let stderr = child.stderr.take().context("lane stderr")?;
     let transcript = spec.transcript.clone();
     let (tx, rx) = mpsc::channel::<ReaderOut>();
 
     let reader = std::thread::spawn(move || {
         let mut file = std::fs::File::create(&transcript).ok();
         let mut out = ReaderOut::default();
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        for_each_line(stdout, |line| {
             if let Some(f) = file.as_mut() {
                 let _ = writeln!(f, "{line}");
             }
@@ -206,17 +209,21 @@ pub fn run(mut spec: LaneSpec) -> Result<LaneResult> {
             if let Some(s) = sink.as_mut() {
                 s(line);
             }
-        }
+        });
         let _ = tx.send(out);
     });
-    // Drain stderr so the CLI can't block on a full pipe.
+    // Drain stderr so the CLI can't block on a full pipe. Only the last few
+    // lines are ever reported, so only those are kept: a chatty lane would
+    // otherwise hold its whole stderr in memory for the length of the run.
     let stderr_drain = std::thread::spawn(move || {
-        let mut buf = String::new();
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            buf.push_str(&line);
-            buf.push('\n');
-        }
-        buf
+        let mut keep: VecDeque<String> = VecDeque::with_capacity(STDERR_TAIL);
+        for_each_line(stderr, |line| {
+            if keep.len() == STDERR_TAIL {
+                keep.pop_front();
+            }
+            keep.push_back(line);
+        });
+        keep.into_iter().collect::<Vec<_>>().join("\n")
     });
 
     let deadline = Instant::now() + spec.timeout;
@@ -228,12 +235,12 @@ pub fn run(mut spec: LaneSpec) -> Result<LaneResult> {
         }
         if CANCEL.load(Ordering::SeqCst) {
             cancelled = true;
-            kill_group(pgid);
+            kill_group(pgid, &mut child);
             break child.wait().ok();
         }
         if Instant::now() >= deadline {
             timed_out = true;
-            kill_group(pgid);
+            kill_group(pgid, &mut child);
             break child.wait().ok();
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -252,27 +259,58 @@ pub fn run(mut spec: LaneSpec) -> Result<LaneResult> {
         duration_secs: start.elapsed().as_secs(),
         // Nonzero-exit notice is the caller's call (engine emits it as an
         // event); lanes stay silent so a TUI screen is never corrupted.
-        stderr_tail: tail(&stderr_text, 5),
+        stderr_tail: stderr_text,
         tokens_in: out.tokens_in,
         tokens_out: out.tokens_out,
         cost_usd: out.cost_usd,
     })
 }
 
-fn kill_group(pgid: i32) {
-    unsafe {
-        libc::killpg(pgid, libc::SIGTERM);
-    }
-    std::thread::sleep(Duration::from_secs(5));
-    unsafe {
-        libc::killpg(pgid, libc::SIGKILL);
+/// How many trailing stderr lines a lane result carries.
+const STDERR_TAIL: usize = 5;
+
+/// Feed a child's pipe to `f` one line at a time, until EOF or a read error.
+/// Byte-oriented because `lines()` yields `InvalidData` on a non-UTF-8 byte, and
+/// both obvious ways to handle that are wrong: `map_while` ends the drain there,
+/// leaving the child blocked on a pipe nobody empties, and `filter_map` spins
+/// forever if the error is a real one that repeats. Reading bytes has neither
+/// problem, and a lossy line is fine for output that is only logged or parsed.
+pub fn for_each_line(pipe: impl std::io::Read, mut f: impl FnMut(String)) {
+    let mut r = BufReader::new(pipe);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match r.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {
+                while matches!(buf.last(), Some(b'\n' | b'\r')) {
+                    buf.pop();
+                }
+                f(String::from_utf8_lossy(&buf).into_owned());
+            }
+        }
     }
 }
 
-pub fn tail(text: &str, lines: usize) -> String {
-    let v: Vec<&str> = text.lines().collect();
-    let start = v.len().saturating_sub(lines);
-    v[start..].join("\n")
+/// SIGTERM the group, then SIGKILL whatever is still standing. Polls instead of
+/// sleeping the full grace period, so a CLI that exits on the first signal does
+/// not cost the TUI five seconds on every cancel.
+pub fn kill_group(pgid: i32, child: &mut std::process::Child) {
+    // SAFETY: killpg only sends a signal to a process group id; an already-dead
+    // group fails with ESRCH, which is the outcome we want anyway.
+    unsafe {
+        libc::killpg(pgid, libc::SIGTERM);
+    }
+    let grace = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < grace {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    unsafe {
+        libc::killpg(pgid, libc::SIGKILL);
+    }
 }
 
 // ---- prompts ----------------------------------------------------------
@@ -625,9 +663,6 @@ mod tests {
 
     #[test]
     fn tail_last_lines() {
-        assert_eq!(tail("a\nb\nc", 2), "b\nc");
-        assert_eq!(tail("a", 5), "a");
-        assert_eq!(tail("", 3), "");
     }
 
     #[test]

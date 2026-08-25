@@ -144,7 +144,7 @@ pub fn run(id: &str, tx: &Sender<Progress>) -> Result<i32> {
 
     // Gate 0: baseline must be green, else red proves nothing.
     let _ = tx.send(Progress::Stage(format!("[0/5] baseline check: {test_cmd}")));
-    let base = match harness::run_tests(&wt_verif, test_cmd) {
+    let base = match harness::run_tests(&wt_verif, test_cmd, timeout) {
         Ok(o) => o,
         Err(e) => return fail(&run_dir, &mut st, &log, tx, "baseline_unrunnable", format!("{e:#}")),
     };
@@ -154,6 +154,9 @@ pub fn run(id: &str, tx: &Sender<Progress>) -> Result<i32> {
         ok: base.green,
         detail: if base.green { String::new() } else { base.tail.clone() },
     });
+    if base.timed_out {
+        return fail(&run_dir, &mut st, &log, tx, "baseline_timeout", base.tail);
+    }
     if !base.green {
         return fail(&run_dir, &mut st, &log, tx, "vacuous_baseline", base.tail);
     }
@@ -206,7 +209,7 @@ pub fn run(id: &str, tx: &Sender<Progress>) -> Result<i32> {
     if let Err(e) = worktree::apply_patch(&wt_verif, &tests_patch) {
         return fail(&run_dir, &mut st, &log, tx, "verif_apply_failed", format!("{e:#}"));
     }
-    let red = match harness::run_tests(&wt_verif, test_cmd) {
+    let red = match harness::run_tests(&wt_verif, test_cmd, timeout) {
         Ok(o) => o,
         Err(e) => return fail(&run_dir, &mut st, &log, tx, "red_gate_unrunnable", format!("{e:#}")),
     };
@@ -216,6 +219,11 @@ pub fn run(id: &str, tx: &Sender<Progress>) -> Result<i32> {
         ok: !red.green,
         detail: if red.green { "tests pass without any implementation".into() } else { String::new() },
     });
+    // A hang is not a red. The gate asks whether the tests fail *because the
+    // feature is missing*, and a suite that never finished has not answered.
+    if red.timed_out {
+        return fail(&run_dir, &mut st, &log, tx, "red_gate_timeout", red.tail);
+    }
     if red.green {
         return fail(&run_dir, &mut st, &log, tx, "vacuous_tests", "tests pass without any implementation".into());
     }
@@ -300,7 +308,7 @@ pub fn run(id: &str, tx: &Sender<Progress>) -> Result<i32> {
         if let Err(e) = worktree::apply_patch(&wt_verif, &impl_patch) {
             return fail(&run_dir, &mut st, &log, tx, "verif_apply_failed", format!("{e:#}"));
         }
-        let green = match harness::run_tests(&wt_verif, test_cmd) {
+        let green = match harness::run_tests(&wt_verif, test_cmd, timeout) {
             Ok(o) => o,
             Err(e) => {
                 return fail(&run_dir, &mut st, &log, tx, "green_gate_unrunnable", format!("{e:#}"))
@@ -520,6 +528,7 @@ pub fn fix(
     require_approved_spec(&run_dir, &st)?;
     let log = events::EventLog::new(&run_dir);
     let test_cmd = &cfg.commands.test;
+    let timeout = Duration::from_secs(cfg.limits.lane_timeout_secs);
 
     let (tests_patch, impl_patch) = read_patches(&run_dir).context("nothing to fix")?;
     // The keys, not just the count: when a fix breaks the suite the Failure tab
@@ -638,7 +647,7 @@ pub fn fix(
         worktree::reset_hard(&wt_verif)?;
         worktree::apply_patch(&wt_verif, &tests_patch)?;
         worktree::apply_patch(&wt_verif, &new_impl)?;
-        let green = harness::run_tests(&wt_verif, test_cmd)?;
+        let green = harness::run_tests(&wt_verif, test_cmd, timeout)?;
         log.append("green_gate", json!({"green": green.green, "exit": green.exit_code, "after": "fix", "round": round}))?;
         std::fs::write(run_dir.join("green.txt"), &green.tail)?;
         let _ = tx.send(Progress::GateResult {
