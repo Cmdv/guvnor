@@ -242,7 +242,7 @@ impl App {
             evidence(std::fs::read_to_string(dir.join("green.txt")).ok()),
         );
 
-        let status = Line::from(vec![status_badge(&st.status.to_string()), Span::raw(" ")]);
+        let status = Line::from(vec![status_badge(&st.status), Span::raw(" ")]);
         // One hash of spec.json, checked against both pins below.
         let sha = spec_sha(&dir);
         // The patches on disk were derived from a spec that has since been
@@ -761,7 +761,7 @@ mod tests {
         let mut app = App::for_test();
         let mut v = view(vec![0], vec![0, 1, 2, REVIEW_TAB]);
         v.info = Line::from(Span::raw("more math functions"));
-        v.status = Line::from(vec![status_badge("reviewed"), Span::raw(" ")]);
+        v.status = Line::from(vec![status_badge(&state::Status::Reviewed), Span::raw(" ")]);
         v.next = Line::from(vec![
             Span::raw(" ▸ "),
             Span::raw("c"),

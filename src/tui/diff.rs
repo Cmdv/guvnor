@@ -10,7 +10,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 /// One collapsible row: a file's hunks, or the run's evidence.
 pub struct Section {
@@ -18,6 +18,33 @@ pub struct Section {
     pub head: Line<'static>,
     pub body: Vec<Line<'static>>,
     pub open: bool,
+    /// The body wrapped to a width, kept until the width changes. `hang_wrap`
+    /// allocates per character, and both the renderer and `head_y` want the same
+    /// answer, so recomputing it per frame and again per keypress burns real
+    /// memory bandwidth on a list that has not changed.
+    wrapped: RefCell<Option<(usize, Vec<Line<'static>>)>>,
+}
+
+impl Section {
+    pub fn new(head: Line<'static>, body: Vec<Line<'static>>) -> Self {
+        Self { head, body, open: false, wrapped: RefCell::new(None) }
+    }
+
+    /// The body wrapped to `w`, computed once per width.
+    fn wrapped(&self, w: usize) -> std::cell::Ref<'_, Vec<Line<'static>>> {
+        {
+            let mut c = self.wrapped.borrow_mut();
+            if c.as_ref().is_none_or(|(cached, _)| *cached != w) {
+                *c = Some((w, hang_wrap_all(&self.body, w)));
+            }
+        }
+        std::cell::Ref::map(self.wrapped.borrow(), |c| &c.as_ref().expect("just filled").1)
+    }
+
+    /// Rows this section draws when open, including its trailing blank.
+    fn open_rows(&self, w: usize) -> u16 {
+        u16::try_from(self.wrapped(w).len() + 1).unwrap_or(u16::MAX)
+    }
 }
 
 /// A gate tab's diff: the files, a cursor, and the scroll they share.
@@ -45,25 +72,24 @@ impl DiffView {
         let raw = std::fs::read_to_string(patch).unwrap_or_default();
         let mut sections = patch_sections(&raw);
         if sections.is_empty() {
-            sections.push(Section {
-                head: Line::styled("(no patch recorded)", Style::new().fg(Color::DarkGray)),
-                body: Vec::new(),
-                open: false,
-            });
+            sections.push(Section::new(
+                Line::styled("(no patch recorded)", Style::new().fg(Color::DarkGray)),
+                Vec::new(),
+            ));
         }
-        sections.push(Section { head: ev_head, body: ev_body, open: false });
+        sections.push(Section::new(ev_head, ev_body));
         Self { sections, ..Default::default() }
     }
 
     /// Which drawn line section `i`'s row sits on: every row above it, plus the
     /// body (and its trailing blank) of any of them that is open.
     fn head_y(&self, i: usize) -> u16 {
-        let mut y = 1; // the box's blank lead line
+        let mut y = 1usize; // the box's blank lead line
         let w = self.body_w.get().max(1) as usize;
         for s in self.sections.iter().take(i) {
-            y += 1 + if s.open { hang_wrap_all(&s.body, w).len() as u16 + 1 } else { 0 };
+            y += 1 + if s.open { s.open_rows(w) as usize } else { 0 };
         }
-        y
+        u16::try_from(y).unwrap_or(u16::MAX)
     }
 
     /// Scroll only if the cursor would otherwise be off-screen.
@@ -187,11 +213,7 @@ pub fn patch_sections(patch: &str) -> Vec<Section> {
     }
     files
         .into_iter()
-        .map(|f| Section {
-            head: head_line(&f.path, f.kind, f.adds, f.dels),
-            body: f.hunks,
-            open: false,
-        })
+        .map(|f| Section::new(head_line(&f.path, f.kind, f.adds, f.dels), f.hunks))
         .collect()
 }
 
@@ -219,7 +241,7 @@ pub fn render_diff(f: &mut Frame, area: Rect, v: &DiffView) {
         }
         lines.push(head);
         if s.open {
-            lines.extend(hang_wrap_all(&s.body, area.width as usize));
+            lines.extend(s.wrapped(area.width as usize).iter().cloned());
             lines.push(Line::raw(""));
         }
     }
@@ -254,6 +276,20 @@ index 0000000..1111111
 +one
 +two
 ";
+
+    /// The wrapped body is cached per width, so a resize has to invalidate it or
+    /// the rows drawn and the cursor's idea of them drift apart.
+    #[test]
+    fn the_wrap_cache_follows_the_width() {
+        let long = "x ".repeat(60);
+        let s = Section::new(Line::raw("head"), vec![Line::raw(long)]);
+        let wide = s.wrapped(120).len();
+        let narrow = s.wrapped(40).len();
+        assert!(narrow > wide, "narrower must wrap to more rows: {narrow} vs {wide}");
+        // and coming back gives the same answer, not a stale one
+        assert_eq!(s.wrapped(120).len(), wide);
+        assert_eq!(s.open_rows(40) as usize, narrow + 1, "plus the trailing blank");
+    }
 
     /// One row per file, the plumbing gone, and the counts taken from the hunks
     /// rather than from anything the model said.

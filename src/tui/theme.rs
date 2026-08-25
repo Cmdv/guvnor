@@ -2,6 +2,7 @@
 //! place, so the look can't drift screen to screen.
 
 use crate::review::Severity;
+use crate::state::Status;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -183,25 +184,27 @@ pub fn gates_line(g: &crate::state::Gates) -> Line<'static> {
 ///
 /// Four colours, four meanings: grey = still working, cyan = your move,
 /// green = landed, yellow = you said no, red = broken.
-pub fn status_badge(status: &str) -> Span<'static> {
+pub fn status_badge(status: &Status) -> Span<'static> {
     let (label, bg) = match status {
-        "planned" => ("planned", Color::Gray),
-        "spec_approved" => ("spec approved", Color::Gray),
-        "red_ok" => ("tests are red", Color::Gray),
-        "green_ok" => ("tests are green", Color::Gray),
-        "reviewed" => ("reviewed", Color::Cyan),
-        "staged" => ("staged", Color::Green),
-        "committed" => ("committed", Color::Green),
+        Status::Planned => ("planned", Color::Gray),
+        Status::SpecApproved => ("spec approved", Color::Gray),
+        Status::RedOk => ("tests are red", Color::Gray),
+        Status::GreenOk => ("tests are green", Color::Gray),
+        Status::Reviewed => ("reviewed", Color::Cyan),
+        Status::Staged => ("staged", Color::Green),
+        Status::Committed => ("committed", Color::Green),
         // A rejection is a decision you made, not a thing that broke.
-        s if s.starts_with("failed:rejected_") => {
-            return Span::styled(
-                format!(" rejected: {} ", &s["failed:rejected_".len()..]),
-                Style::new().bg(Color::Yellow).fg(Color::Black).bold(),
-            )
-        }
-        // The red already says "failed"; the prefix only eats column width that
-        // the reason itself needs.
-        s => (s.strip_prefix("failed:").unwrap_or(s), Color::Red),
+        Status::Failed(why) => match why.strip_prefix("rejected_") {
+            Some(gate) => {
+                return Span::styled(
+                    format!(" rejected: {gate} "),
+                    Style::new().bg(Color::Yellow).fg(Color::Black).bold(),
+                )
+            }
+            // The red already says "failed"; a prefix would only eat the column
+            // width the reason itself needs.
+            None => (why.as_str(), Color::Red),
+        },
     };
     Span::styled(format!(" {label} "), Style::new().bg(bg).fg(Color::Black).bold())
 }
@@ -348,8 +351,8 @@ mod tests {
 
     #[test]
     fn pad_badge_widens_the_block_and_keeps_its_colour() {
-        let reviewed = status_badge("reviewed"); // " reviewed ", cyan
-        let w = status_badge("spec_approved").content.chars().count(); // " spec approved "
+        let reviewed = status_badge(&Status::Reviewed); // " reviewed ", cyan
+        let w = status_badge(&Status::SpecApproved).content.chars().count(); // " spec approved "
         let padded = pad_badge(reviewed.clone(), w);
         assert_eq!(padded.content.chars().count(), w, "padded out to the widest");
         assert_eq!(padded.style, reviewed.style, "colour untouched");
@@ -374,23 +377,33 @@ mod tests {
     /// of them is filled, and the colour is the class, not the string.
     #[test]
     fn every_status_is_a_filled_chip_in_words() {
-        for s in ["planned", "spec_approved", "red_ok", "green_ok", "reviewed", "staged",
-                  "committed", "failed:vacuous_tests", "failed:rejected_work"] {
-            let b = status_badge(s);
+        let failed = |w: &str| Status::Failed(w.to_string());
+        for s in [
+            Status::Planned,
+            Status::SpecApproved,
+            Status::RedOk,
+            Status::GreenOk,
+            Status::Reviewed,
+            Status::Staged,
+            Status::Committed,
+            failed("vacuous_tests"),
+            failed("rejected_work"),
+        ] {
+            let b = status_badge(&s);
             assert!(b.style.bg.is_some(), "{s} must be filled, not plain text");
-            assert!(!b.content.contains('_') || s.starts_with("failed:"),
+            assert!(!b.content.contains('_') || matches!(s, Status::Failed(_)),
                     "{s} rendered as the machine string: {}", b.content);
         }
         // the classes: landed is green, your-move is cyan, broken is red, and a
         // rejection is a decision (yellow) rather than a fault
-        assert_eq!(status_badge("committed").style.bg, Some(Color::Green));
-        assert_eq!(status_badge("staged").style.bg, Some(Color::Green));
-        assert_eq!(status_badge("reviewed").style.bg, Some(Color::Cyan));
-        assert_eq!(status_badge("planned").style.bg, Some(Color::Gray));
-        assert_eq!(status_badge("failed:vacuous_tests").style.bg, Some(Color::Red));
+        assert_eq!(status_badge(&Status::Committed).style.bg, Some(Color::Green));
+        assert_eq!(status_badge(&Status::Staged).style.bg, Some(Color::Green));
+        assert_eq!(status_badge(&Status::Reviewed).style.bg, Some(Color::Cyan));
+        assert_eq!(status_badge(&Status::Planned).style.bg, Some(Color::Gray));
+        assert_eq!(status_badge(&failed("vacuous_tests")).style.bg, Some(Color::Red));
         // the prefix is dead weight next to a red chip; the reason is not
-        assert_eq!(status_badge("failed:vacuous_tests").content, " vacuous_tests ");
-        let r = status_badge("failed:rejected_work");
+        assert_eq!(status_badge(&failed("vacuous_tests")).content, " vacuous_tests ");
+        let r = status_badge(&failed("rejected_work"));
         assert_eq!(r.style.bg, Some(Color::Yellow));
         assert_eq!(r.content, " rejected: work ");
     }

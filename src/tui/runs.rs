@@ -227,7 +227,7 @@ impl App {
             // line up in a column instead of leaving a ragged gap. One badge per
             // row, built once: the width pass and the row pass read the same spans.
             let badges: Vec<Span> =
-                vis.iter().map(|i| status_badge(&self.runs[*i].status.to_string())).collect();
+                vis.iter().map(|i| status_badge(&self.runs[*i].status)).collect();
             let status_w = badges.iter().map(|b| b.content.chars().count()).max().unwrap_or(0);
             let rows: Vec<Row> = vis
                 .iter()
