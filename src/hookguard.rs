@@ -14,9 +14,13 @@ use std::path::{Component, Path};
 /// verdicts); evidence a lane can edit is not evidence.
 const DENIED: &[&str] = &[".claude/", ".guvnor/"];
 
-/// The first denied prefix this repo-relative path falls under, if any.
+/// The denied surface this repo-relative path falls under, if any. Matches the
+/// first path component, case-folded: the bare directory and any case variant
+/// name the same inode on a case-insensitive filesystem (macOS by default).
 pub fn denied_prefix(rel: &str) -> Option<&'static str> {
-    DENIED.iter().copied().find(|d| rel.starts_with(d))
+    let first = Path::new(rel).components().next()?;
+    let first = first.as_os_str().to_string_lossy().to_lowercase();
+    DENIED.iter().copied().find(|d| d.trim_end_matches('/') == first)
 }
 
 pub fn run_write_guard() -> Result<i32> {
@@ -26,8 +30,7 @@ pub fn run_write_guard() -> Result<i32> {
         .as_str()
         .or_else(|| v["tool_input"]["notebook_path"].as_str())
         .unwrap_or("");
-    let project_dir = std::env::var("CLAUDE_PROJECT_DIR")
-        .unwrap_or_else(|_| std::env::current_dir().unwrap().display().to_string());
+    let project_dir = project_dir()?;
     // Per-run deny list: exact repo-relative paths an earlier lane already owns.
     // Read from `.claude/deny` (written by `lane::write_settings`), NUL-joined —
     // the one byte no POSIX path can ever contain, so it needs no escaping.
@@ -55,8 +58,7 @@ pub fn run_read_guard() -> Result<i32> {
     let ti = &v["tool_input"];
     // Read uses file_path; Glob/Grep use an optional path (empty = cwd)
     let path = ti["file_path"].as_str().or_else(|| ti["path"].as_str()).unwrap_or("");
-    let project_dir = std::env::var("CLAUDE_PROJECT_DIR")
-        .unwrap_or_else(|_| std::env::current_dir().unwrap().display().to_string());
+    let project_dir = project_dir()?;
     match check_read(path, &project_dir) {
         Ok(()) => Ok(0),
         Err(msg) => {
@@ -73,9 +75,6 @@ pub fn check_read(path: &str, project_dir: &str) -> Result<(), String> {
         return Ok(());
     }
     let rel = relativize(path, project_dir)?;
-    if Path::new(&rel).components().any(|c| matches!(c, Component::ParentDir)) {
-        return Err("path traversal".into());
-    }
     if let Some(d) = denied_prefix(&rel) {
         return Err(format!("'{rel}' is guvnor's own control surface ({d})"));
     }
@@ -104,9 +103,6 @@ pub fn check_write(file_path: &str, project_dir: &str, deny: &[String]) -> Resul
         return Err("no file path in tool input".into());
     }
     let rel = relativize(file_path, project_dir)?;
-    if Path::new(&rel).components().any(|c| matches!(c, Component::ParentDir)) {
-        return Err("path traversal".into());
-    }
     if let Some(d) = denied_prefix(&rel) {
         return Err(format!("'{rel}' is guvnor's own control surface ({d})"));
     }
@@ -118,19 +114,38 @@ pub fn check_write(file_path: &str, project_dir: &str, deny: &[String]) -> Resul
     Ok(())
 }
 
+/// One repo-relative form for a path that may arrive absolute, `./`-prefixed,
+/// or with redundant separators. Errs on anything that leaves the project dir.
+/// `Path::components` does the normalising, so `.` and `//` collapse and a `..`
+/// survives as a `ParentDir` to reject rather than as text to pattern-match.
 fn relativize(file_path: &str, project_dir: &str) -> Result<String, String> {
-    let p = file_path.replace('\\', "/");
-    if !p.starts_with('/') {
-        // "./x" and "x" name the same file; compare in one form
-        return Ok(p.trim_start_matches("./").to_string());
+    let p = Path::new(file_path);
+    let rel = if p.is_absolute() {
+        p.strip_prefix(project_dir)
+            .map_err(|_| format!("absolute path outside project dir {project_dir}"))?
+    } else {
+        p
+    };
+    let mut out = std::path::PathBuf::new();
+    for c in rel.components() {
+        match c {
+            Component::CurDir => {}
+            Component::Normal(s) => out.push(s),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err("path traversal".into())
+            }
+        }
     }
-    let root = format!("{}/", project_dir.trim_end_matches('/'));
-    p.strip_prefix(&root)
-        .map(|r| r.trim_start_matches("./").to_string())
-        .ok_or_else(|| format!("absolute path outside project dir {project_dir}"))
+    Ok(out.to_string_lossy().into_owned())
 }
 
-/// Block history-mutating git regardless of flags/subcommand position.
+/// Block history-mutating git regardless of flags/subcommand position, plus any
+/// command that names a control surface, steps outside the worktree, or
+/// re-enters guvnor. A shell has no per-path tool input to guard, so the check
+/// is on the raw text and refuses wholesale: `cat ../<sibling>-tests/test/x`
+/// reads around `check_read`, `rm -rf ../../runs/<id>` deletes the evidence,
+/// and `guvnor approve` would let a lane hold its own gate. It over-blocks
+/// (`ls ..`) on purpose. A lane has no business outside the tree it was handed.
 pub fn check_bash(command: &str) -> Result<(), String> {
     let words: Vec<&str> = command
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
@@ -138,10 +153,20 @@ pub fn check_bash(command: &str) -> Result<(), String> {
         .collect();
     const BANNED: &[&str] =
         &["commit", "push", "reset", "rebase", "merge", "tag", "worktree", "cherry-pick", "am"];
-    if words.contains(&"git") {
+    // Case-insensitive: PATH lookup on a case-insensitive filesystem resolves
+    // `GIT` to the same binary.
+    if words.iter().any(|w| w.eq_ignore_ascii_case("git")) {
         if let Some(bad) = words.iter().find(|w| BANNED.contains(&w.to_lowercase().as_str())) {
             return Err(format!("git {bad} is forbidden in lanes; report instead"));
         }
+    }
+    for pat in [".guvnor", ".claude", ".."] {
+        if command.contains(pat) {
+            return Err(format!("'{pat}' is out of bounds for a lane shell"));
+        }
+    }
+    if words.iter().any(|w| w.eq_ignore_ascii_case("guvnor")) {
+        return Err("guvnor's verbs are the human's; a lane may not hold its own gate".into());
     }
     Ok(())
 }
@@ -150,6 +175,16 @@ fn read_stdin() -> Result<String> {
     let mut s = String::new();
     std::io::stdin().read_to_string(&mut s)?;
     Ok(s)
+}
+
+/// The worktree the lane runs in. Claude Code sets `CLAUDE_PROJECT_DIR`; cwd is
+/// the fallback. Fallible rather than `unwrap`, because a panicking guard exits
+/// 101 and Claude Code lets the tool call through on anything but exit 2.
+fn project_dir() -> Result<String> {
+    match std::env::var("CLAUDE_PROJECT_DIR") {
+        Ok(d) => Ok(d),
+        Err(_) => Ok(std::env::current_dir()?.display().to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -202,6 +237,24 @@ mod tests {
     }
 
     #[test]
+    fn denied_surfaces_survive_path_spelling() {
+        // one denied file, every spelling of it that reaches the same inode
+        for p in [
+            "/wt//.claude/settings.json",
+            "/wt/.//.claude/settings.json",
+            ".//.claude/settings.json",
+            "/wt///.guvnor/runs/x/state.json",
+            ".CLAUDE/settings.json", // case-insensitive filesystem
+            ".Guvnor/runs/x/state.json",
+            ".claude", // the directory itself: Grep would read the deny file
+            ".guvnor",
+        ] {
+            assert!(check_write(p, "/wt", &no_deny()).is_err(), "write allowed: {p}");
+            assert!(check_read(p, "/wt").is_err(), "read allowed: {p}");
+        }
+    }
+
+    #[test]
     fn reads_are_fenced_to_the_worktree() {
         assert!(check_read("src/a.js", "/wt").is_ok());
         assert!(check_read("/wt/src/a.js", "/wt").is_ok());
@@ -222,9 +275,26 @@ mod tests {
         assert!(check_bash("git commit -m x").is_err());
         assert!(check_bash("git -C /tmp push origin").is_err());
         assert!(check_bash("cd a && git rebase main").is_err());
+        assert!(check_bash("GIT push origin HEAD:main").is_err()); // PATH is case-insensitive
         assert!(check_bash("git status && git diff").is_ok());
         assert!(check_bash("cabal test spec").is_ok());
         // 'commit' outside a git command is fine
         assert!(check_bash("echo commit").is_ok());
+    }
+
+    #[test]
+    fn bash_cannot_route_around_the_path_guards() {
+        // the decorrelation hole: the tests, by any route a shell offers
+        assert!(check_bash("cat ../r-tests/test/FooSpec.hs").is_err());
+        assert!(check_bash("cat ../../runs/r/tests.patch").is_err());
+        assert!(check_bash("grep -r x /repo/.guvnor/runs").is_err());
+        assert!(check_bash("rm -rf ../../runs/r").is_err());
+        assert!(check_bash("printf x > .claude/settings.json").is_err());
+        // and a lane may not hold its own gate
+        assert!(check_bash("guvnor approve r --gate work").is_err());
+        assert!(check_bash("cd /x && GUVNOR commit r -m x").is_err());
+        // ordinary lane work still runs
+        assert!(check_bash("node --test").is_ok());
+        assert!(check_bash("ls src && cat src/lib.rs").is_ok());
     }
 }

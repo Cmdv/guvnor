@@ -155,6 +155,10 @@ pub fn run(mut spec: LaneSpec) -> Result<LaneResult> {
         // A lane must not inherit the outer agent session's identity.
         .env_remove("CLAUDECODE")
         .env_remove("CLAUDE_CODE_ENTRYPOINT")
+        // Marks every descendant as lane-spawned. `main` refuses the approval
+        // and landing verbs when it is set, so the gates stay with the human
+        // even if a command evades the bash guard's token check.
+        .env("GUVNOR_LANE", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -339,13 +343,20 @@ HUMAN FEEDBACK:
     )
 }
 
+/// The containment rules every writer lane shares, worded as the guards in
+/// `hookguard` actually enforce them. Stated up front in the prompt so a lane
+/// spends no turns discovering them; the hooks are the backstop, not the notice.
+const FENCE: &str = "\
+- You may create/edit files anywhere in this repository EXCEPT .guvnor/ and .claude/ (guvnor's own control files).
+- Never run git commit/push/reset/rebase/merge/tag.
+- Shell commands may not name .guvnor, .claude, `..`, or guvnor itself: stay inside this worktree and report instead of reaching outside it.";
+
 pub fn testwriter_prompt(spec_render: &str, tests_paths: &[String], test_cmd: &str) -> String {
     format!(
         r#"You are a TEST-WRITER working from a spec. You have never seen any implementation and must not create one.
 
 HARD CONSTRAINTS (enforced by hooks; violations are blocked):
-- You may create/edit files anywhere in this repository EXCEPT .guvnor/ and .claude/ (guvnor's own control files).
-- Never run git commit/push/reset/rebase/merge/tag.
+{FENCE}
 - Do NOT write the implementation. Your tests MUST fail on this tree: a suite that
   passes without an implementation is rejected outright (red gate) and the run fails.
 - Tests belong under: {tp}
@@ -366,8 +377,7 @@ pub fn implementer_prompt(spec_render: &str, src_paths: &[String], test_cmd: &st
         r#"You are an IMPLEMENTER working from a spec. Independent tests you cannot see will judge your work.
 
 HARD CONSTRAINTS (enforced by hooks; violations are blocked):
-- You may create/edit files anywhere in this repository EXCEPT .guvnor/ and .claude/ (guvnor's own control files).
-- Never run git commit/push/reset/rebase/merge/tag.
+{FENCE}
 - Do NOT create or modify test files. The spec's Files list may name test files:
   ignore those entries. An independent test-writer lane already wrote them, they
   are not in your tree, and the hook blocks you from creating them.
@@ -398,8 +408,7 @@ pub fn rework_prompt(
         r#"You are an IMPLEMENTER on rework round {round}/{max}. A previous implementation attempt is already in this working tree, but independent tests you cannot see are failing against it.
 
 HARD CONSTRAINTS (enforced by hooks; violations are blocked):
-- You may create/edit files anywhere in this repository EXCEPT .guvnor/ and .claude/ (guvnor's own control files).
-- Never run git commit/push/reset/rebase/merge/tag.
+{FENCE}
 - Do not create or modify tests.
 - Implementation belongs under: {sp}
 
@@ -472,8 +481,7 @@ calling something unnecessary does not make it unnecessary; the test decides.
         r#"You are an IMPLEMENTER fixing review findings. Your implementation is already in this working tree and the independent tests you cannot see currently PASS against it. A human selected the findings below as the ones worth fixing.
 
 HARD CONSTRAINTS (enforced by hooks; violations are blocked):
-- You may create/edit files anywhere in this repository EXCEPT .guvnor/ and .claude/ (guvnor's own control files).
-- Never run git commit/push/reset/rebase/merge/tag.
+{FENCE}
 - Do not create or modify tests.
 - Implementation belongs under: {sp}
 - Do NOT break what already works: the tests must still pass afterwards.
@@ -698,6 +706,11 @@ mod tests {
         let t = testwriter_prompt("SPEC", &["test/".into()], "node --test");
         assert!(t.find("HARD CONSTRAINTS").unwrap() < t.find("SPEC").unwrap());
         let i = implementer_prompt("SPEC", &["src/".into()], "node --test");
+        // every writer lane states the fence the guards enforce, shell included
+        let rw = rework_prompt("SPEC", &["src/".into()], "node --test", "fail", 1, 1);
+        for p in [&t, &i, &rw] {
+            assert!(p.contains(FENCE), "prompt is missing the fence");
+        }
         assert!(i.contains("Do NOT create or modify test files"));
         // the spec's Files list names test files; the prompt must override it
         assert!(i.contains("ignore those entries"));

@@ -13,7 +13,7 @@ mod state;
 mod tui;
 mod worktree;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use clap::{Parser, Subcommand};
 use engine::Progress;
 use state::Gate;
@@ -112,12 +112,35 @@ fn run(cli: Cli) -> Result<i32> {
     let Some(cmd) = cli.cmd else {
         return tui::run(verbose);
     };
+    // Holding a gate and landing a diff are the human's. `lane::run` sets
+    // GUVNOR_LANE on the CLI it spawns and the whole tree inherits it, so a lane
+    // that reaches this binary still cannot approve its own work.
+    if std::env::var_os("GUVNOR_LANE").is_some() {
+        let verb = match &cmd {
+            Cmd::Approve { .. } => "approve",
+            Cmd::Reject { .. } => "reject",
+            Cmd::Stage { .. } => "stage",
+            Cmd::Unstage { .. } => "unstage",
+            Cmd::Commit { .. } => "commit",
+            _ => "",
+        };
+        if !verb.is_empty() {
+            bail!("`{verb}` is the human's call and this is a lane; report instead");
+        }
+    }
     match cmd {
-        Cmd::Hook { which } => match which {
+        // Claude Code blocks a tool call on exit 2 and treats every other
+        // non-zero code as a non-blocking error, letting the call through. So a
+        // guard that cannot do its job denies rather than propagating.
+        Cmd::Hook { which } => Ok(match which {
             HookCmd::Write => hookguard::run_write_guard(),
             HookCmd::Read => hookguard::run_read_guard(),
             HookCmd::Bash => hookguard::run_bash_guard(),
-        },
+        }
+        .unwrap_or_else(|e| {
+            eprintln!("guvnor: hook guard failed, denying: {e:#}");
+            2
+        })),
         Cmd::Plan { title, context } => run_op(verbose, move |tx| engine::plan(&title, &context, tx)),
         Cmd::Run { id } => run_op(verbose, move |tx| engine::run(&id, tx)),
         Cmd::Review { id } => {
