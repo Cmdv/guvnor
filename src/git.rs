@@ -2,7 +2,11 @@ use anyhow::{bail, Context, Result};
 use std::path::Path;
 use std::process::Command;
 
-pub fn git(dir: &Path, args: &[&str]) -> Result<String> {
+/// Raw stdout from a git command. Patch capture needs the exact bytes: lossy
+/// decoding would substitute U+FFFD before the digest is taken and before the
+/// patch reaches disk, so two different patches could share a digest and the
+/// stored one would no longer apply.
+pub fn git_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let out = Command::new("git")
         .args(args)
         .current_dir(dir)
@@ -16,7 +20,13 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<String> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    Ok(out.stdout)
+}
+
+/// Stdout as text. Fine for the commands whose output guvnor only reads (hashes,
+/// status, paths it prints); `git_bytes` is for anything that gets hashed.
+pub fn git(dir: &Path, args: &[&str]) -> Result<String> {
+    Ok(String::from_utf8_lossy(&git_bytes(dir, args)?).into_owned())
 }
 
 /// True if the repo has at least one commit (HEAD resolves). A fresh
