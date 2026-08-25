@@ -116,6 +116,17 @@ pub enum JobKind {
     Fix,
     /// Drafting a commit message: the only job that doesn't own the screen.
     Draft,
+    /// Touching the repo: stage, unstage, commit. Each is a handful of git
+    /// processes, which is long enough to drop frames if the UI thread runs
+    /// them, and each has a different follow-up once it lands.
+    Land(Land),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Land {
+    Stage,
+    Unstage,
+    Commit,
 }
 
 pub enum LogItem {
@@ -415,10 +426,10 @@ impl App {
         }
         lane::reset_cancel();
         let (tx, rx) = std::sync::mpsc::channel();
-        // Every job but a draft owns the screen while it runs. A draft was asked
-        // for from a modal and has to hand its answer back to that modal, so the
-        // modal has to still be there.
-        let stay = matches!(kind, JobKind::Draft);
+        // Lane jobs own the screen while they run. A draft has to hand its answer
+        // back to the modal that asked, and a landing is over in a moment and
+        // reports with a toast, so neither takes the screen away.
+        let stay = matches!(kind, JobKind::Draft | JobKind::Land(_));
         let handle = std::thread::spawn(move || op(&tx));
         self.job = Some(Job {
             kind,
@@ -524,6 +535,23 @@ impl App {
                 }
             }
             // Back into the modal that asked, never onto another screen.
+            // A commit is the one landing that leaves the run screen; the other
+            // two redraw it in place with the stage box refocused.
+            (JobKind::Land(Land::Commit), Outcome::Done(msg)) => {
+                self.commit = None;
+                self.apply(Go::Landed { title: "committed", msg });
+            }
+            (JobKind::Land(what), Outcome::Done(msg)) => match job.run_id {
+                Some(id) => land_finished(self, what, &id, msg),
+                None => self.toast = toast(msg),
+            },
+            (JobKind::Land(_), out) => {
+                self.toast = toast(match out {
+                    Outcome::Error(e) => e,
+                    Outcome::Failed { why } => why,
+                    Outcome::Done(m) => m,
+                });
+            }
             // Matched on the run that asked, so a draft can never land in another
             // run's modal: `open_commit` refuses to show run X's words under run
             // Y, and this arrives asynchronously enough to have done just that.

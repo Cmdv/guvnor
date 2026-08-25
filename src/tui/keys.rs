@@ -537,9 +537,26 @@ impl App {
             }
             Go::Progress => self.screen = Screen::Progress,
             // The stage box's actions: they touch the repo, then rebuild the run
-            // screen back onto the Review tab with the box refocused.
-            Go::Stage(id) => stage_now(self, &id),
-            Go::Unstage(id) => unstage_now(self, &id),
+            // screen back onto the Review tab with the box refocused. The git
+            // work runs off the UI thread; `maybe_finish` does the rebuild.
+            Go::Stage(id) => {
+                let id2 = id.clone();
+                self.toast = toast("staging …");
+                self.start_job(JobKind::Land(Land::Stage), Some(id), move |tx| {
+                    let msg = engine::stage(&id2)?;
+                    let _ = tx.send(Progress::Done(msg));
+                    Ok(0)
+                })
+            }
+            Go::Unstage(id) => {
+                let id2 = id.clone();
+                self.toast = toast("unstaging …");
+                self.start_job(JobKind::Land(Land::Unstage), Some(id), move |tx| {
+                    let msg = engine::unstage(&id2)?;
+                    let _ = tx.send(Progress::Done(msg));
+                    Ok(0)
+                })
+            }
             Go::OpenCommit(id) => self.open_commit(&id),
             Go::Draft(id) => {
                 let id2 = id.clone();

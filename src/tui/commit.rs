@@ -261,31 +261,21 @@ pub fn commit_key(app: &mut App, key: &KeyEvent) -> Option<Go> {
     }
 }
 
-/// Put the change in your working tree and stop, then redraw the box: it now
-/// offers `commit` and `unstage` instead, which is the whole point of stopping.
-/// Called from `apply` on `Go::Stage`, so it has the run id already.
-pub fn stage_now(app: &mut App, id: &str) {
-    match crate::engine::stage(id) {
-        Ok(msg) => {
-            app.toast = toast(msg);
-            app.reopen_stage(id);
-        }
-        Err(e) => app.toast = toast(format!("{e:#}")),
+/// What a finished landing job leaves behind. The repo work already happened on
+/// the job's thread; this is the redraw, so the box now offers `commit` and
+/// `unstage` instead of `stage`, which is the whole point of stopping there.
+///
+/// ponytail: `reopen_stage` still costs two git calls on the UI thread. That is
+/// down from the seven a synchronous stage ran, and the expensive one
+/// (`git status`) moved with the job. Push the rebuild into the job too if a
+/// large repo still drops frames here.
+pub fn land_finished(app: &mut App, what: Land, id: &str, msg: String) {
+    if what == Land::Unstage {
+        // the draft describes a change that is no longer anywhere
+        app.commit = None;
     }
-}
-
-/// Looked at it, don't want it: back out of the tree. The run keeps everything,
-/// so it can be staged again or sent through a fix round.
-pub fn unstage_now(app: &mut App, id: &str) {
-    match crate::engine::unstage(id) {
-        Ok(msg) => {
-            // the draft describes a change that is no longer anywhere
-            app.commit = None;
-            app.toast = toast(msg);
-            app.reopen_stage(id);
-        }
-        Err(e) => app.toast = toast(format!("{e:#}")),
-    }
+    app.toast = toast(msg);
+    app.reopen_stage(id);
 }
 
 /// The only thing here that writes history. Stages first if you skipped that,
@@ -307,17 +297,13 @@ fn commit_now(app: &mut App) -> Option<Go> {
         ));
         return None;
     }
-    match crate::engine::commit(&id, &subject, &body) {
-        Ok(msg) => {
-            // Landed: the draft described a commit that now exists.
-            app.commit = None;
-            Some(Go::Landed { title: "committed", msg })
-        }
-        Err(e) => {
-            app.toast = toast(format!("{e:#}"));
-            None
-        }
-    }
+    app.toast = toast("committing …");
+    app.start_job(JobKind::Land(Land::Commit), Some(id.clone()), move |tx| {
+        let msg = crate::engine::commit(&id, &subject, &body)?;
+        let _ = tx.send(Progress::Done(msg));
+        Ok(0)
+    });
+    None
 }
 
 impl App {
@@ -520,6 +506,30 @@ mod tests {
         assert!(msg.contains(&(SUBJECT_MAX + 1).to_string()), "{msg}");
         // the run is untouched either way: nothing reached the repo
         assert!(app.commit.is_some());
+        assert!(app.job.is_none(), "a refused subject must not reach the repo at all");
+    }
+
+    /// Staging spawns a handful of git processes, `git status` among them. Run on
+    /// the UI thread that is a frozen screen with no frame drawn until it is
+    /// over, so the three landing verbs go through a job like every other engine
+    /// call. They keep the screen rather than taking it: each is brief and
+    /// reports with a toast.
+    #[test]
+    fn the_landing_verbs_do_not_run_on_the_ui_thread() {
+        for go in [Go::Stage("x".into()), Go::Unstage("x".into())] {
+            let mut app = App::for_test();
+            app.apply(go);
+            assert!(app.job.is_some(), "the verb must be handed to a job");
+            assert!(matches!(app.screen, Screen::Runs), "and must not take the screen");
+            assert!(app.toast.is_some(), "with something on screen saying so");
+        }
+        // commit too, once it has a subject worth writing
+        let mut app = App::for_test();
+        let mut v = CommitView::new("x".into());
+        v.set_message("add a thing");
+        app.commit = Some(v);
+        assert!(commit_now(&mut app).is_none());
+        assert!(app.job.is_some(), "commit must be handed to a job as well");
     }
 
     #[test]
