@@ -16,11 +16,13 @@ pub fn render(run_dir: &Path) -> Result<String> {
         s.push_str(&spec.render());
     }
 
-    for (label, file, sha) in [
-        ("Tests patch", "tests.patch", &state.tests_patch_sha256),
-        ("Implementation patch", "impl.patch", &state.impl_patch_sha256),
-    ] {
+    // The digest is taken from the bytes on the line above it. Carrying it in
+    // state.json instead let the two drift: the patch is written to disk well
+    // before the state is saved, so any error in between left this printing
+    // yesterday's digest as fact.
+    for (label, file) in [("Tests patch", "tests.patch"), ("Implementation patch", "impl.patch")] {
         if let Ok(patch) = std::fs::read_to_string(run_dir.join(file)) {
+            let sha = crate::digest::sha256_hex(patch.as_bytes());
             let files = crate::worktree::patch_paths(&patch);
             let added = patch.lines().filter(|l| l.starts_with('+') && !l.starts_with("+++")).count();
             let removed = patch.lines().filter(|l| l.starts_with('-') && !l.starts_with("---")).count();
@@ -37,7 +39,15 @@ pub fn render(run_dir: &Path) -> Result<String> {
         ));
     }
     if let Ok(green) = std::fs::read_to_string(run_dir.join("green.txt")) {
-        s.push_str(&format!("\n## Green evidence (tests pass with implementation)\n```\n{green}\n```\n"));
+        // green.txt holds whatever the last green-gate run printed, pass or fail.
+        // Only a run that got past the gate may call it evidence of passing;
+        // before that it is the failure, and saying otherwise inverts the claim.
+        let heading = if state.green_gate_passed() {
+            "Green evidence (tests pass with implementation)"
+        } else {
+            "Green gate output (the tests did NOT pass)"
+        };
+        s.push_str(&format!("\n## {heading}\n```\n{green}\n```\n"));
     }
 
     if let Ok(raw) = std::fs::read_to_string(run_dir.join("review.json")) {
@@ -176,8 +186,11 @@ pub fn cost_rows(run_dir: &Path) -> Vec<CostRow> {
             ("lane_impl_fix", _) if round > 0 => format!("fix {fix_n} retry {round}"),
             ("lane_impl_fix", _) if fix_n == 1 => "fix".to_string(),
             ("lane_impl_fix", _) => format!("fix {fix_n}"),
-            (_, 1) => "review".to_string(),
-            (_, n) => format!("review {n}"),
+            ("reviewed", 1) => "review".to_string(),
+            ("reviewed", n) => format!("review {n}"),
+            // Named, not caught: a `_` arm here would file the next lane anyone
+            // adds under "review" in the ledger a human reads to check costs.
+            _ => continue,
         };
         rows.push(CostRow { name, tin: i, tout: o, cost: c });
     }

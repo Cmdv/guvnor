@@ -99,3 +99,11 @@ fn read_patches(run_dir: &Path) -> Result<(String, String)> {
     };
     Ok((read("tests.patch")?, read("impl.patch")?))
 }
+
+/// The two patches as one byte string: what the reviewer's verdict is digested
+/// over, what the landing re-digests, and what `git apply` receives. All three
+/// have to agree byte for byte or an approval binds to something nobody read,
+/// so they read it from here rather than each spelling out the same `format!`.
+fn combined(tests_patch: &str, impl_patch: &str) -> String {
+    format!("{tests_patch}\n{impl_patch}")
+}

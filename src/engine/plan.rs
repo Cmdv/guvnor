@@ -132,6 +132,10 @@ pub fn replan(id: &str, feedback: &str, tx: &Sender<Progress>) -> Result<i32> {
     } else {
         let sid = new_session_id()?;
         st.planner_session_id = sid.clone();
+        // Persist before the lane runs: the session exists on Claude's side the
+        // moment it is created, so a lane that errors would otherwise lose the
+        // only handle to it and the next replan would open another cold one.
+        st.save(&run_dir)?;
         (
             lane::Session::Create(sid),
             lane::replanner_prompt(&st.title, &prev, feedback, &cfg.commands.test),
@@ -148,6 +152,7 @@ pub fn replan(id: &str, feedback: &str, tx: &Sender<Progress>) -> Result<i32> {
             ));
             let sid = new_session_id()?;
             st.planner_session_id = sid.clone();
+            st.save(&run_dir)?;
             let text = planner_lane(
                 &cfg,
                 &repo,

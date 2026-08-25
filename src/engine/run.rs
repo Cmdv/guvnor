@@ -70,15 +70,11 @@ fn overlap_detail(overlap: &[String]) -> String {
     )
 }
 
-pub fn run(id: &str, tx: &Sender<Progress>) -> Result<i32> {
-    let repo = config::find_repo_root()?;
-    let cfg = Config::load(&repo)?;
-    if let Some(w) = decorrelation_warning(&cfg) {
-        let _ = tx.send(Progress::Stage(w));
-    }
-    let run_dir = state::resolve_run_dir(&repo, id)?;
-    let mut st = State::load(&run_dir)?;
-    let sp = Spec::load(&run_dir.join("spec.json"))?;
+/// No lane spends a token against a spec no human has accepted, and none spends
+/// one against a spec edited since. Both the initial run and a fix round go
+/// through here, because a `replan` resets the gate and a fix round would
+/// otherwise implement against the spec that replacement threw away.
+fn require_approved_spec(run_dir: &Path, st: &State) -> Result<()> {
     if !st.gates.spec.approved {
         bail!(
             "spec not approved. Read {} then `guvnor approve {} --gate spec`",
@@ -93,6 +89,19 @@ pub fn run(id: &str, tx: &Sender<Progress>) -> Result<i32> {
             st.id
         );
     }
+    Ok(())
+}
+
+pub fn run(id: &str, tx: &Sender<Progress>) -> Result<i32> {
+    let repo = config::find_repo_root()?;
+    let cfg = Config::load(&repo)?;
+    if let Some(w) = decorrelation_warning(&cfg) {
+        let _ = tx.send(Progress::Stage(w));
+    }
+    let run_dir = state::resolve_run_dir(&repo, id)?;
+    let mut st = State::load(&run_dir)?;
+    let sp = Spec::load(&run_dir.join("spec.json"))?;
+    require_approved_spec(&run_dir, &st)?;
     let log = events::EventLog::new(&run_dir);
     // This run will overwrite both patches, so any tick on them was for a diff
     // that is about to stop existing. `approval_checks` would catch it at the
@@ -108,7 +117,12 @@ pub fn run(id: &str, tx: &Sender<Progress>) -> Result<i32> {
             json!({"gate": "tests,work", "why": "re-run — the lanes write fresh patches"}),
         )?;
     }
-    let test_cmd = &sp.verification;
+    // The human's configured command, never `sp.verification`. That field is
+    // written by the planner lane and lands in `sh -c` with no guard between,
+    // so a planner that read an injected file could append `git push` to it and
+    // guvnor would run it three times a run. It stays in the spec as prompt
+    // text, where a lane reads it and nothing executes it.
+    let test_cmd = &cfg.commands.test;
     let timeout = Duration::from_secs(cfg.limits.lane_timeout_secs);
 
     // Keep the worktree container (.guvnor/wt/) out of git before we touch it.
@@ -130,7 +144,10 @@ pub fn run(id: &str, tx: &Sender<Progress>) -> Result<i32> {
 
     // Gate 0: baseline must be green, else red proves nothing.
     let _ = tx.send(Progress::Stage(format!("[0/5] baseline check: {test_cmd}")));
-    let base = harness::run_tests(&wt_verif, test_cmd)?;
+    let base = match harness::run_tests(&wt_verif, test_cmd) {
+        Ok(o) => o,
+        Err(e) => return fail(&run_dir, &mut st, &log, tx, "baseline_unrunnable", format!("{e:#}")),
+    };
     log.append("baseline", json!({"green": base.green, "exit": base.exit_code}))?;
     let _ = tx.send(Progress::GateResult {
         gate: "baseline".into(),
@@ -180,15 +197,19 @@ pub fn run(id: &str, tx: &Sender<Progress>) -> Result<i32> {
         return fail(&run_dir, &mut st, &log, tx, "tests_forbidden_paths", format!("{e:#}"));
     }
     std::fs::write(run_dir.join("tests.patch"), &tests_patch)?;
-    st.tests_patch_sha256 = digest::sha256_hex(tests_patch.as_bytes());
     // From here the artifacts on disk belong to this spec, and a later replan
     // is detectable by comparing this against spec.json.
     st.spec_sha_at_run = st.gates.spec.sha256.clone();
 
     // Gate 2 (red): tests must FAIL on base.
     let _ = tx.send(Progress::Stage("[2/5] red gate: tests must fail on base".into()));
-    worktree::apply_patch(&wt_verif, &tests_patch)?;
-    let red = harness::run_tests(&wt_verif, test_cmd)?;
+    if let Err(e) = worktree::apply_patch(&wt_verif, &tests_patch) {
+        return fail(&run_dir, &mut st, &log, tx, "verif_apply_failed", format!("{e:#}"));
+    }
+    let red = match harness::run_tests(&wt_verif, test_cmd) {
+        Ok(o) => o,
+        Err(e) => return fail(&run_dir, &mut st, &log, tx, "red_gate_unrunnable", format!("{e:#}")),
+    };
     log.append("red_gate", json!({"green": red.green, "exit": red.exit_code}))?;
     let _ = tx.send(Progress::GateResult {
         gate: "red".into(),
@@ -263,7 +284,6 @@ pub fn run(id: &str, tx: &Sender<Progress>) -> Result<i32> {
         return fail(&run_dir, &mut st, &log, tx, "impl_touched_test_files", overlap_detail(&overlap));
     }
     std::fs::write(run_dir.join("impl.patch"), &impl_patch)?;
-    st.impl_patch_sha256 = digest::sha256_hex(impl_patch.as_bytes());
 
     // Gate 4 (green): tests must PASS with the implementation. On failure the
     // implementer lane gets the failing output back — evidence-driven, bounded
@@ -277,8 +297,15 @@ pub fn run(id: &str, tx: &Sender<Progress>) -> Result<i32> {
         } else {
             format!("[4/5] green gate: re-check after rework {round}/{max_rework}")
         }));
-        worktree::apply_patch(&wt_verif, &impl_patch)?;
-        let green = harness::run_tests(&wt_verif, test_cmd)?;
+        if let Err(e) = worktree::apply_patch(&wt_verif, &impl_patch) {
+            return fail(&run_dir, &mut st, &log, tx, "verif_apply_failed", format!("{e:#}"));
+        }
+        let green = match harness::run_tests(&wt_verif, test_cmd) {
+            Ok(o) => o,
+            Err(e) => {
+                return fail(&run_dir, &mut st, &log, tx, "green_gate_unrunnable", format!("{e:#}"))
+            }
+        };
         log.append("green_gate", json!({"green": green.green, "exit": green.exit_code, "round": round}))?;
         std::fs::write(run_dir.join("green.txt"), &green.tail)?;
         let _ = tx.send(Progress::GateResult {
@@ -354,11 +381,13 @@ pub fn run(id: &str, tx: &Sender<Progress>) -> Result<i32> {
             return fail(&run_dir, &mut st, &log, tx, "impl_touched_test_files", overlap_detail(&overlap));
         }
         std::fs::write(run_dir.join("impl.patch"), &p)?;
-        st.impl_patch_sha256 = digest::sha256_hex(p.as_bytes());
         impl_patch = p;
         // verif tree back to base + tests before re-applying the cumulative patch
-        worktree::reset_hard(&wt_verif)?;
-        worktree::apply_patch(&wt_verif, &tests_patch)?;
+        if let Err(e) = worktree::reset_hard(&wt_verif)
+            .and_then(|()| worktree::apply_patch(&wt_verif, &tests_patch))
+        {
+            return fail(&run_dir, &mut st, &log, tx, "verif_apply_failed", format!("{e:#}"));
+        }
     }
     st.status = Status::GreenOk;
     st.save(&run_dir)?;
@@ -388,12 +417,16 @@ fn review_and_finish(
         "[5/5] reviewer lane ({}) ...",
         cfg.claude.model_reviewer
     )));
-    let combined = format!("{tests_patch}\n{impl_patch}");
+    let combined = combined(tests_patch, impl_patch);
     // The reviewer has no shell (a claim to have run tests proves nothing — the
     // green gate already ran them). Hand it the gate's own output, written to
     // green.txt by both callers immediately above, or it cannot judge a
     // "tests pass" criterion and will file its denied Bash as a finding.
     let green = std::fs::read_to_string(run_dir.join("green.txt")).unwrap_or_default();
+    // The verif tree has never had settings written to it, so without this the
+    // reviewer runs with no read fence and loads whatever .claude/settings.json
+    // it happens to find. Empty deny list: it reads the whole tree by design.
+    lane::write_settings(wt_verif, &[])?;
     let rres = lane::run(lane::LaneSpec {
         cwd: wt_verif,
         claude_bin: &cfg.claude.bin,
@@ -484,8 +517,9 @@ pub fn fix(
         );
     }
     let sp = Spec::load(&run_dir.join("spec.json"))?;
+    require_approved_spec(&run_dir, &st)?;
     let log = events::EventLog::new(&run_dir);
-    let test_cmd = &sp.verification;
+    let test_cmd = &cfg.commands.test;
 
     let (tests_patch, impl_patch) = read_patches(&run_dir).context("nothing to fix")?;
     // The keys, not just the count: when a fix breaks the suite the Failure tab
@@ -633,7 +667,6 @@ pub fn fix(
         round += 1;
     };
     std::fs::write(run_dir.join("impl.patch"), &new_impl)?;
-    st.impl_patch_sha256 = digest::sha256_hex(new_impl.as_bytes());
     // The approved work no longer exists — that verdict was for the old diff.
     st.gates.work = Default::default();
     st.status = Status::GreenOk;

@@ -130,10 +130,6 @@ pub struct State {
     pub status: Status,
     pub gates: Gates,
     #[serde(default)]
-    pub tests_patch_sha256: String,
-    #[serde(default)]
-    pub impl_patch_sha256: String,
-    #[serde(default)]
     pub red_reason: String,
     /// Claude session id for the planner while iterating the spec. Kept
     /// across replans so iterations resume one session; cleared on spec
@@ -167,14 +163,22 @@ pub fn finding_key(f: &crate::review::Finding) -> String {
 }
 
 impl State {
+    /// Did this run get past the green gate? Everything from `GreenOk` onward
+    /// did, by construction: the pipeline sets that status only after the tests
+    /// passed with the implementation, and no later state walks back to it.
+    pub fn green_gate_passed(&self) -> bool {
+        matches!(
+            self.status,
+            Status::GreenOk | Status::Reviewed | Status::Staged | Status::Committed
+        )
+    }
+
     pub fn new(id: &str, title: &str) -> Self {
         Self {
             id: id.into(),
             title: title.into(),
             status: Status::Planned,
             gates: Gates::default(),
-            tests_patch_sha256: String::new(),
-            impl_patch_sha256: String::new(),
             red_reason: String::new(),
             planner_session_id: String::new(),
             fixed_findings: Vec::new(),
@@ -190,8 +194,17 @@ impl State {
         Ok(serde_json::from_str(&raw)?)
     }
 
+    /// Write then rename, which is atomic on one filesystem. A plain write
+    /// truncates in place, and `stage` changes the user's index before it saves:
+    /// a crash in that window would leave the patches applied and `staged_tree`
+    /// gone, and `staged_tree` is the only record of what guvnor may still undo.
     pub fn save(&self, run_dir: &Path) -> Result<()> {
-        std::fs::write(run_dir.join("state.json"), serde_json::to_string_pretty(self)?)?;
+        let path = run_dir.join("state.json");
+        let tmp = run_dir.join("state.json.tmp");
+        std::fs::write(&tmp, serde_json::to_string_pretty(self)?)
+            .with_context(|| format!("cannot write {}", tmp.display()))?;
+        std::fs::rename(&tmp, &path)
+            .with_context(|| format!("cannot replace {}", path.display()))?;
         Ok(())
     }
 }

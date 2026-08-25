@@ -1,8 +1,17 @@
 use super::*;
 
 pub fn set_gate(id: &str, gate: state::Gate, note: &str, approve: bool) -> Result<String> {
-    let repo = config::find_repo_root()?;
-    let run_dir = state::resolve_run_dir(&repo, id)?;
+    set_gate_at(&config::find_repo_root()?, id, gate, note, approve)
+}
+
+fn set_gate_at(
+    repo: &Path,
+    id: &str,
+    gate: state::Gate,
+    note: &str,
+    approve: bool,
+) -> Result<String> {
+    let run_dir = state::resolve_run_dir(repo, id)?;
     let mut st = State::load(&run_dir)?;
     if approve {
         if gate == state::Gate::Spec {
@@ -18,12 +27,19 @@ pub fn set_gate(id: &str, gate: state::Gate, note: &str, approve: bool) -> Resul
     slot.approved = approve;
     slot.ts = events::now_iso();
     slot.note = note.to_string();
+    // A gate records the human's decision; where the run is in its life is not
+    // the gate's to rewrite. Overwriting `Staged` would leave guvnor's patches
+    // in the tree with no `unstage` willing to own them, and overwriting
+    // `Committed` would erase the record of a commit that exists.
+    let landed = matches!(st.status, Status::Staged | Status::Committed);
     if approve && gate == state::Gate::Spec {
-        st.status = Status::SpecApproved;
+        if !landed {
+            st.status = Status::SpecApproved;
+        }
         // Spec accepted — close the iterating planner session.
         st.planner_session_id.clear();
     }
-    if !approve {
+    if !approve && !landed {
         st.status = Status::Failed(format!("rejected_{}", gate.as_str()));
     }
     st.save(&run_dir)?;
@@ -83,7 +99,7 @@ fn approval_checks(run_dir: &Path, st: &State) -> Result<(String, String)> {
     let (tests_patch, impl_patch) = read_patches(run_dir)?;
     // The reviewer's verdict is bound to a digest of the exact bytes it read.
     // Without this an approval could slide onto a different diff.
-    let combined = format!("{tests_patch}\n{impl_patch}");
+    let combined = combined(&tests_patch, &impl_patch);
     if digest::sha256_hex(combined.as_bytes()) != review.diff_sha256 {
         bail!("patches on disk do not match the reviewed diff digest — stale or tampered; re-run");
     }
@@ -138,7 +154,7 @@ pub fn commit_message(id: &str, tx: &Sender<Progress>) -> Result<i32> {
     let run_dir = state::resolve_run_dir(&repo, id)?;
     let sp = Spec::load(&run_dir.join("spec.json"))?;
     let (tests_patch, impl_patch) = read_patches(&run_dir)?;
-    let diff = format!("{tests_patch}\n{impl_patch}");
+    let diff = combined(&tests_patch, &impl_patch);
     let _ = tx.send(Progress::Stage(format!(
         "drafting a commit message ({}) ...",
         cfg.claude.model_worker
@@ -151,8 +167,11 @@ pub fn commit_message(id: &str, tx: &Sender<Progress>) -> Result<i32> {
         // interfaces, verification) is guvnor's process, and none of it is
         // committed: in `git log` a year from now it names nothing that exists.
         prompt: lane::commit_msg_prompt(sp.objective.trim(), &diff),
-        // Reads only: it has the diff in the prompt and nothing to write.
-        allowed_tools: "Read,Glob,Grep",
+        // No tools at all. The diff and the objective are already in the prompt,
+        // so there is nothing to look up, and this is the one lane whose cwd is
+        // the developer's real repo rather than a throwaway worktree: with no
+        // tools there is no fence to get wrong.
+        allowed_tools: "",
         timeout: Duration::from_secs(cfg.limits.lane_timeout_secs),
         transcript: run_dir.join("lanes-commitmsg.ndjson"),
         line_sink: lane_sink(tx, "commit message"),
@@ -210,8 +229,11 @@ fn stage_at(repo: &Path, id: &str) -> Result<String> {
         bail!("{DRIFTED}");
     }
     let (tests_patch, impl_patch) = commit_checks(repo, &run_dir, &st)?;
-    worktree::apply_patch_staged(repo, &tests_patch)?;
-    worktree::apply_patch_staged(repo, &impl_patch)?;
+    // One invocation, because `git apply` is atomic per invocation: applied
+    // separately, a second patch that fails leaves the first in your tree with
+    // status still `Reviewed` and `staged_tree` empty, so no verb owns it. The
+    // concatenation is the same byte string the approval digest binds to.
+    worktree::apply_patch_staged(repo, &combined(&tests_patch, &impl_patch))?;
     st.staged_tree = index_tree(repo)?;
     st.status = Status::Staged;
     st.save(&run_dir)?;
@@ -242,9 +264,11 @@ fn unstage_at(repo: &Path, id: &str) -> Result<String> {
         bail!("{DRIFTED}");
     }
     let (tests_patch, impl_patch) = read_patches(&run_dir)?;
-    // Reverse order, so the tree passes back through the states it came by.
-    worktree::reverse_patch_staged(repo, &impl_patch)?;
-    worktree::reverse_patch_staged(repo, &tests_patch)?;
+    // One invocation, same reason as `stage_at`: a half-reversed tree is a state
+    // where all three verbs refuse. Hunk order does not matter here because the
+    // two patches are checked for overlap before either is ever kept, so they
+    // touch disjoint files.
+    worktree::reverse_patch_staged(repo, &combined(&tests_patch, &impl_patch))?;
     st.staged_tree = String::new();
     st.status = Status::Reviewed;
     st.save(&run_dir)?;
@@ -369,7 +393,7 @@ mod land_tests {
         std::fs::create_dir_all(&run_dir).unwrap();
         std::fs::write(run_dir.join("tests.patch"), &tests_patch).unwrap();
         std::fs::write(run_dir.join("impl.patch"), &impl_patch).unwrap();
-        let combined = format!("{tests_patch}\n{impl_patch}");
+        let combined = super::combined(&tests_patch, &impl_patch);
         let review = review::Review {
             verdict: review::Verdict {
                 verdict: decision,
@@ -424,6 +448,78 @@ mod land_tests {
         std::fs::write(run_dir.join("impl.patch"), "tampered\n").unwrap();
         let e = stage_at(&repo, &id).unwrap_err().to_string();
         assert!(e.contains("impl.patch is not what the work gate approved"), "{e}");
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// A gate records a human's decision about content; it does not get to say
+    /// where the run is in its life. Overwriting `Staged` used to leave guvnor's
+    /// own patches sitting in the tree with `unstage` refusing to own them
+    /// ("nothing staged for this run"), recoverable only with `git reset`.
+    #[test]
+    fn a_gate_decision_does_not_rewrite_a_landed_status() {
+        let (repo, id) = fixture("gate-vs-status");
+        let run_dir = state::resolve_run_dir(&repo, &id).unwrap();
+        stage_at(&repo, &id).unwrap();
+        assert_eq!(status(&repo, &id), Status::Staged);
+        // spec.json has to exist and parse for an approval to bind to it
+        let sp = crate::spec::Spec {
+            title: "t".into(),
+            objective: "o".into(),
+            files: vec!["src/a.js".into()],
+            interfaces: vec!["f()".into()],
+            constraints: vec![],
+            verification: "true".into(),
+            acceptance_criteria: vec!["a".into()],
+        };
+        std::fs::write(run_dir.join("spec.json"), serde_json::to_string(&sp).unwrap()).unwrap();
+
+        set_gate_at(&repo, &id, state::Gate::Spec, "again", true).unwrap();
+        assert_eq!(status(&repo, &id), Status::Staged, "re-approving must not un-stage it");
+        assert!(unstage_at(&repo, &id).is_ok(), "and unstage must still own it");
+
+        // and a rejection cannot erase the record of a commit that exists
+        stage_at(&repo, &id).unwrap();
+        commit_at(&repo, &id, "add a", "").unwrap();
+        set_gate_at(&repo, &id, state::Gate::Work, "changed my mind", false).unwrap();
+        assert_eq!(status(&repo, &id), Status::Committed);
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Staging applies both patches in one `git apply`, so a second one that
+    /// cannot apply leaves nothing behind. Applied separately, the first landed
+    /// in the user's index while the run still called itself `Reviewed`: guvnor
+    /// had changed the repo with no record that it had.
+    #[test]
+    fn a_patch_that_cannot_apply_leaves_the_tree_untouched() {
+        let (repo, id) = fixture("half-apply");
+        let run_dir = state::resolve_run_dir(&repo, &id).unwrap();
+        // impl.patch now claims to edit a file that does not exist on base
+        let broken = "diff --git a/src/ghost.js b/src/ghost.js\n\
+                      --- a/src/ghost.js\n\
+                      +++ b/src/ghost.js\n\
+                      @@ -1 +1 @@\n\
+                      -was here\n\
+                      +is here\n";
+        std::fs::write(run_dir.join("impl.patch"), broken).unwrap();
+        let tests_patch = std::fs::read_to_string(run_dir.join("tests.patch")).unwrap();
+        // keep the approvals and the verdict honest about the new pair
+        let mut st = State::load(&run_dir).unwrap();
+        st.gates.work.sha256 = digest::sha256_hex(broken.as_bytes());
+        st.save(&run_dir).unwrap();
+        let mut review: review::Review =
+            serde_json::from_str(&std::fs::read_to_string(run_dir.join("review.json")).unwrap())
+                .unwrap();
+        review.diff_sha256 = digest::sha256_hex(combined(&tests_patch, broken).as_bytes());
+        std::fs::write(run_dir.join("review.json"), serde_json::to_string(&review).unwrap())
+            .unwrap();
+
+        assert!(stage_at(&repo, &id).is_err(), "an unappliable patch must not stage");
+        assert_eq!(
+            git::git(&repo, &["status", "--porcelain"]).unwrap().trim(),
+            "",
+            "the tests half must not be left in the tree"
+        );
+        assert_eq!(status(&repo, &id), Status::Reviewed, "and the run keeps its status");
         std::fs::remove_dir_all(&repo).ok();
     }
 
