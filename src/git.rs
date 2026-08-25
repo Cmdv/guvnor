@@ -55,6 +55,17 @@ pub fn ensure_baseline_commit(repo: &Path) -> Result<bool> {
     Ok(true)
 }
 
+/// A repo that can commit without borrowing the machine's git identity. Tests
+/// that shell out to `git commit` need one of their own: a CI runner has no
+/// global config, and a developer's signing key is not the test's business.
+#[cfg(test)]
+pub fn init_test_repo(dir: &Path) {
+    git(dir, &["init", "-q"]).unwrap();
+    for kv in [("user.email", "t@t"), ("user.name", "t"), ("commit.gpgsign", "false")] {
+        git(dir, &["config", kv.0, kv.1]).unwrap();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -64,8 +75,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("guvnor-baseline-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
-        git(&dir, &["init", "-q"]).unwrap();
-        // commit identity comes from the ambient git config, same as real use
+        init_test_repo(&dir);
         assert!(!head_exists(&dir)); // fresh init: no HEAD
         assert!(ensure_baseline_commit(&dir).unwrap()); // creates it
         assert!(head_exists(&dir));

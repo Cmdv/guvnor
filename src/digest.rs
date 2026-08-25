@@ -74,7 +74,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("guvnor-dirty-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
-        git(&dir, &["init", "-q"]).unwrap();
+        crate::git::init_test_repo(&dir);
         ensure_baseline_commit(&dir).unwrap();
         // stand in for an applied impl.patch: a new, untracked file
         std::fs::write(dir.join("impl.js"), "first\n").unwrap();

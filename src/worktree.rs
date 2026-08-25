@@ -308,7 +308,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::create_dir_all(dir.join(".guvnor/runs/x")).unwrap();
-        git(&dir, &["init", "-q"]).unwrap();
+        crate::git::init_test_repo(&dir);
         std::fs::write(dir.join("src/keep.txt"), "keep me\n").unwrap();
         git(&dir, &["add", "-A"]).unwrap();
         git(&dir, &["commit", "-qm", "base"]).unwrap();
@@ -425,7 +425,7 @@ diff --git a/src/a.js b/src/a.js
         let dir = std::env::temp_dir().join(format!("guvnor-wtignore-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
-        git(&dir, &["init", "-q"]).unwrap();
+        crate::git::init_test_repo(&dir);
         std::fs::write(dir.join("f"), "x").unwrap();
         git(&dir, &["add", "-A"]).unwrap();
         git(&dir, &["commit", "-qm", "init"]).unwrap();

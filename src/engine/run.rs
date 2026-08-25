@@ -710,7 +710,7 @@ mod amend_tests {
         let (run, wt) = (dir.join("run"), dir.join("wt"));
         std::fs::create_dir_all(&run).unwrap();
         std::fs::create_dir_all(&wt).unwrap();
-        crate::git::git(&wt, &["init", "-q"]).unwrap();
+        crate::git::init_test_repo(&wt);
         crate::git::ensure_baseline_commit(&wt).unwrap();
 
         // nothing to seed from

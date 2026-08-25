@@ -360,13 +360,11 @@ mod land_tests {
         std::fs::remove_dir_all(&repo).ok();
         std::fs::create_dir_all(&repo).unwrap();
         let git = |args: &[&str]| git::git(&repo, args).unwrap();
-        git(&["init", "-q", "."]);
-        git(&["config", "user.email", "t@t"]);
-        git(&["config", "user.name", "t"]);
-        // a signing key in the developer's global config is not this test's
-        // business (a real repo keeps its own — guvnor shells out to `git
-        // commit` precisely so your settings apply)
-        git(&["config", "commit.gpgsign", "false"]);
+        // Its own identity, and no signing: a developer's global git config is
+        // not this test's business (a real repo keeps its own — guvnor shells
+        // out to `git commit` precisely so your settings apply), and a CI runner
+        // has no identity to borrow.
+        crate::git::init_test_repo(&repo);
         // run artifacts live in the repo but are never part of it
         std::fs::create_dir_all(repo.join(".guvnor")).unwrap();
         std::fs::write(repo.join(".guvnor/.gitignore"), "runs/\nwt/\n").unwrap();
