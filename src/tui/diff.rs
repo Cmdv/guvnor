@@ -129,7 +129,7 @@ pub fn patch_sections(patch: &str) -> Vec<Section> {
         dels: usize,
     }
     let mut files: Vec<FileDiff> = Vec::new();
-    for l in patch.lines() {
+    for (l, in_hunk) in crate::worktree::patch_lines(patch) {
         if let Some(rest) = l.strip_prefix("diff --git ") {
             // `a/path b/path`; a placeholder good enough for a binary diff
             // (no `---`/`+++` pair follows those), overwritten below for the
@@ -140,32 +140,36 @@ pub fn patch_sections(patch: &str) -> Vec<Section> {
         }
         // Anything before the first `diff --git` is git's own preamble.
         let Some(f) = files.last_mut() else { continue };
-        if l.starts_with("new file") {
-            f.kind = "new";
-            continue;
-        }
-        if l.starts_with("deleted file") {
-            f.kind = "deleted";
-            continue;
-        }
-        // The authoritative path: each of these is a fixed prefix then the
-        // path to end of line, so nothing in the path (a space, or literally
-        // " b/") can be mistaken for the header's own syntax.
-        if let Some(p) = l.strip_prefix("--- a/").or_else(|| l.strip_prefix("+++ b/")) {
-            f.path = p.to_string();
-        }
-        // index / mode / rename headers and the ---,+++ pair: the row says all
-        // of it (or it doesn't matter), and every one of them is a line the
-        // human has to skip past to reach the change.
-        if l.starts_with("index ")
-            || l.starts_with("--- ")
-            || l.starts_with("+++ ")
-            || l.starts_with("old mode")
-            || l.starts_with("new mode")
-            || l.starts_with("similarity ")
-            || l.starts_with("rename ")
-        {
-            continue;
+        // Header prefixes only mean anything outside a hunk; inside one they are
+        // the human's own removed and added lines.
+        if !in_hunk {
+            if l.starts_with("new file") {
+                f.kind = "new";
+                continue;
+            }
+            if l.starts_with("deleted file") {
+                f.kind = "deleted";
+                continue;
+            }
+            // The authoritative path: each of these is a fixed prefix then the
+            // path to end of line, so nothing in the path (a space, or literally
+            // " b/") can be mistaken for the header's own syntax.
+            if let Some(p) = l.strip_prefix("--- a/").or_else(|| l.strip_prefix("+++ b/")) {
+                f.path = p.to_string();
+            }
+            // index / mode / rename headers and the ---,+++ pair: the row says
+            // all of it (or it doesn't matter), and every one of them is a line
+            // the human has to skip past to reach the change.
+            if l.starts_with("index ")
+                || l.starts_with("--- ")
+                || l.starts_with("+++ ")
+                || l.starts_with("old mode")
+                || l.starts_with("new mode")
+                || l.starts_with("similarity ")
+                || l.starts_with("rename ")
+            {
+                continue;
+            }
         }
         let style = match l.chars().next() {
             Some('@') => Style::new().fg(Color::Cyan),
@@ -266,6 +270,32 @@ index 0000000..1111111
         assert!(body.contains("@@ -1,2 +1,2 @@"), "hunk headers stay: {body:?}");
         assert!(body.contains("+new line") && body.contains("-old line"));
         assert!(s.iter().all(|f| !f.open), "everything starts collapsed");
+    }
+
+    /// Verbatim `git diff --cached` output for deleting two `--` comments from a
+    /// Haskell file (a shipped language preset). The `-` prefix makes each one
+    /// `--- ...`, which is file-header syntax outside a hunk and the human's own
+    /// deleted code inside one. Eat them and the work gate is judged on a diff
+    /// that is missing lines, with a `-N` count that does not match.
+    #[test]
+    fn removed_comment_lines_are_not_mistaken_for_headers() {
+        let patch = "\
+diff --git a/Mean.hs b/Mean.hs
+index 31d3074..efb9aa1 100644
+--- a/Mean.hs
++++ b/Mean.hs
+@@ -1,4 +1,2 @@
+--- | Compute the mean
+--- second comment
+ mean :: [Double] -> Double
+ mean xs = sum xs / n
+";
+        let s = patch_sections(patch);
+        assert_eq!(s.len(), 1);
+        assert_eq!(line_text(&s[0].head), "modified Mean.hs  +0 -2");
+        let body: String = s[0].body.iter().map(line_text).collect();
+        assert!(body.contains("-- | Compute the mean"), "removed line vanished: {body:?}");
+        assert!(body.contains("-- second comment"), "removed line vanished: {body:?}");
     }
 
     /// Collapsed means collapsed: the tab opens as a list of what changed, and

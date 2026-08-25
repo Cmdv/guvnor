@@ -125,7 +125,11 @@ pub fn init_repo_with(dir: &Path, test: &str, tests: &[&str], src: &[&str]) -> R
     std::fs::write(guvnor_dir.join(".gitignore"), "runs/\n")?;
     let cfg = guvnor_dir.join("guvnor.toml");
     if !cfg.exists() {
-        std::fs::write(&cfg, config_toml(test, tests, src))?;
+        // A template that doesn't parse is unrecoverable in-app: `save_settings`
+        // reads it straight back, and the guard above never rewrites it.
+        let toml = config_toml(test, tests, src);
+        toml.parse::<toml_edit::DocumentMut>().context("generated guvnor.toml does not parse")?;
+        std::fs::write(&cfg, toml)?;
     }
     Ok(cfg)
 }
@@ -178,9 +182,11 @@ pub fn save_settings(repo: &Path, s: &Settings) -> Result<PathBuf> {
 }
 
 /// Render a guvnor.toml with the given command/paths (comments included).
+/// Values go through `toml_edit`, which quotes and escapes them: the test
+/// command is free text from the config modal, and `pytest -k "not slow"`
+/// interpolated raw is a file that can never be read back.
 fn config_toml(test: &str, tests: &[&str], src: &[&str]) -> String {
-    let list =
-        |xs: &[&str]| xs.iter().map(|x| format!("\"{x}\"")).collect::<Vec<_>>().join(", ");
+    let list = |xs: &[&str]| xs.iter().copied().collect::<toml_edit::Array>().to_string();
     format!(
         r#"# guvnor per-repo configuration
 [commands]
@@ -188,13 +194,13 @@ fn config_toml(test: &str, tests: &[&str], src: &[&str]) -> String {
 #   "cabal test spec --test-show-details=direct"
 #   "node --test"
 #   "pytest -q"
-test = "{test}"
+test = {test}
 
 [paths]
-# Repo-relative prefixes. Test-writer writes only under `tests`,
-# implementer only under `src`.
-tests = [{tests}]
-src = [{src}]
+# Repo-relative prefixes, passed to the lane prompts as guidance. The hard
+# fence is guvnor's own control files, not these.
+tests = {tests}
+src = {src}
 
 [claude]
 # bin = "claude"
@@ -208,6 +214,7 @@ src = [{src}]
 # this many times (rework rounds) before the run fails.
 # max_rework_rounds = 1
 "#,
+        test = toml_edit::Value::from(test),
         tests = list(tests),
         src = list(src),
     )
@@ -226,6 +233,24 @@ mod tests {
         assert_eq!(cfg.paths.src, vec!["src/", "app/"]);
         assert_eq!(cfg.claude.bin, "claude");
         assert_eq!(cfg.limits.lane_timeout_secs, 900);
+    }
+
+    /// The test command is free text from the config modal, and the template is
+    /// written before anything reads it back — so a quote interpolated raw
+    /// bricks the config with no in-app way out.
+    #[test]
+    fn a_quoted_test_command_survives_the_template() {
+        for cmd in [
+            r#"pytest -q -k "not slow""#,
+            r#"pytest -k 'not slow'"#,
+            r#"sh -c 'echo "x"'"#,
+            r"cmd \ with \ backslashes",
+        ] {
+            let raw = config_toml(cmd, &["tests/"], &["src/"]);
+            let cfg: Config = toml_edit::de::from_str(&raw)
+                .unwrap_or_else(|e| panic!("{cmd:?} produced unreadable toml: {e}\n{raw}"));
+            assert_eq!(cfg.commands.test, cmd);
+        }
     }
 
     #[test]

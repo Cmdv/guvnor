@@ -140,13 +140,32 @@ fn apply_args(dir: &Path, patch: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// A patch's lines, each tagged with whether it is hunk content rather than a
+/// header. `--- ` and `+++ ` are header syntax in header position only: delete
+/// a line reading `-- | mean` and the patch carries `--- | mean`, which any
+/// scan that ignores the hunk boundary reads as a file header.
+pub fn patch_lines(patch: &str) -> impl Iterator<Item = (&str, bool)> {
+    let mut in_hunk = false;
+    patch.lines().map(move |l| {
+        if l.starts_with("diff --git ") {
+            in_hunk = false;
+        } else if l.starts_with("@@") {
+            in_hunk = true;
+        }
+        (l, in_hunk)
+    })
+}
+
 /// Paths touched by a patch, read from the `---`/`+++` lines: each is a fixed
 /// prefix then the path to end of line, so nothing in the path itself (a
 /// space, or literally " b/") can be mistaken for the header's own syntax the
 /// way splitting the `diff --git` summary line would.
 pub fn patch_paths(patch: &str) -> Vec<String> {
     let mut paths = Vec::new();
-    for line in patch.lines() {
+    for (line, in_hunk) in patch_lines(patch) {
+        if in_hunk {
+            continue;
+        }
         let path = line.strip_prefix("--- a/").or_else(|| line.strip_prefix("+++ b/"));
         if let Some(p) = path {
             if !paths.iter().any(|x| x == p) {
@@ -191,6 +210,23 @@ mod tests {
     #[test]
     fn extracts_unique_paths() {
         assert_eq!(patch_paths(PATCH), vec!["test/A.hs".to_string(), "src/B.hs".to_string()]);
+    }
+
+    /// Verbatim `git diff --cached` output for deleting the line
+    /// `-- a/.guvnor/runs/x/state.json` from a file: the `-` prefix makes it
+    /// `--- a/...`, which is a file header everywhere except inside a hunk.
+    /// Read as one, guvnor rejects its own lane's honest work.
+    #[test]
+    fn a_removed_line_is_not_a_file_header() {
+        let patch = "diff --git a/fixture.txt b/fixture.txt\n\
+                     index 21a87f2..2fa992c 100644\n\
+                     --- a/fixture.txt\n\
+                     +++ b/fixture.txt\n\
+                     @@ -1,2 +1 @@\n \
+                     keep\n\
+                     --- a/.guvnor/runs/x/state.json\n";
+        assert_eq!(patch_paths(patch), vec!["fixture.txt".to_string()]);
+        validate_patch(patch, "tests").unwrap();
     }
 
     #[test]
