@@ -1,17 +1,4 @@
-mod casefile;
-mod config;
-mod digest;
-mod engine;
-mod events;
-mod git;
-mod harness;
-mod hookguard;
-mod lane;
-mod review;
-mod spec;
-mod state;
-mod tui;
-mod worktree;
+use guvnor::{casefile, config, engine, hookguard, state, tui};
 
 use anyhow::{anyhow, bail, Result};
 use clap::{Parser, Subcommand};

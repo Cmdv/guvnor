@@ -31,7 +31,7 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<String> {
 
 /// True if the repo has at least one commit (HEAD resolves). A fresh
 /// `git init` has none, so `git worktree add`/`rev-parse HEAD` both fail.
-fn head_exists(repo: &Path) -> bool {
+pub fn head_exists(repo: &Path) -> bool {
     Command::new("git")
         .args(["rev-parse", "--verify", "-q", "HEAD"])
         .current_dir(repo)
@@ -58,28 +58,9 @@ pub fn ensure_baseline_commit(repo: &Path) -> Result<bool> {
 /// A repo that can commit without borrowing the machine's git identity. Tests
 /// that shell out to `git commit` need one of their own: a CI runner has no
 /// global config, and a developer's signing key is not the test's business.
-#[cfg(test)]
 pub fn init_test_repo(dir: &Path) {
     git(dir, &["init", "-q"]).unwrap();
     for kv in [("user.email", "t@t"), ("user.name", "t"), ("commit.gpgsign", "false")] {
         git(dir, &["config", kv.0, kv.1]).unwrap();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ensure_baseline_commit_bootstraps_fresh_repo() {
-        let dir = std::env::temp_dir().join(format!("guvnor-baseline-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
-        init_test_repo(&dir);
-        assert!(!head_exists(&dir)); // fresh init: no HEAD
-        assert!(ensure_baseline_commit(&dir).unwrap()); // creates it
-        assert!(head_exists(&dir));
-        assert!(!ensure_baseline_commit(&dir).unwrap()); // idempotent
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

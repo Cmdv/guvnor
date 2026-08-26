@@ -20,19 +20,19 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-mod case;
-mod commit;
-mod config_view;
-mod diff;
-mod fail;
-mod keys;
-mod progress;
-mod review;
-mod runs;
-mod spec;
-mod text;
-mod theme;
-mod widgets;
+pub mod case;
+pub mod commit;
+pub mod config_view;
+pub mod diff;
+pub mod fail;
+pub mod keys;
+pub mod progress;
+pub mod review;
+pub mod runs;
+pub mod spec;
+pub mod text;
+pub mod theme;
+pub mod widgets;
 
 // The screens all reach for the same primitives, so they get one import
 // surface: `use super::*` in a screen module. `keys` and `progress` are not
@@ -224,7 +224,6 @@ pub struct App {
     pub focus: HomeFocus,
 }
 
-#[cfg(test)]
 impl App {
     /// A bare app for key-handler tests: no repo scan, no modals, nothing on
     /// disk. `App::new` reloads the run list and can open the config modal,

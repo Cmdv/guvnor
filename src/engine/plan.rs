@@ -17,7 +17,7 @@ fn parse_planner_spec(result_text: &str, default_verification: &str) -> Result<S
 
 /// Dep-free UUID v4 from /dev/urandom (guvnor is unix-only). Used as a stable
 /// Claude session id so spec iterations resume one planner session.
-fn new_session_id() -> Result<String> {
+pub fn new_session_id() -> Result<String> {
     let mut b = [0u8; 16];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
     b[6] = (b[6] & 0x0f) | 0x40; // version 4
@@ -190,20 +190,4 @@ pub fn replan(id: &str, feedback: &str, tx: &Sender<Progress>) -> Result<i32> {
     let _ = tx.send(Progress::RunCreated { id: st.id.clone() });
     let _ = tx.send(Progress::Done("spec revised — read it and approve it".into()));
     Ok(0)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn session_id_is_uuid_v4_shaped() {
-        let id = new_session_id().unwrap();
-        assert_eq!(id.len(), 36);
-        let b = id.as_bytes();
-        assert!(b[8] == b'-' && b[13] == b'-' && b[18] == b'-' && b[23] == b'-');
-        assert_eq!(&id[14..15], "4"); // version 4 nibble
-        assert!(matches!(&id[19..20], "8" | "9" | "a" | "b")); // variant 10xx
-        assert_ne!(new_session_id().unwrap(), id); // not constant
-    }
 }

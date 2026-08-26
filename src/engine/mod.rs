@@ -2,9 +2,9 @@
 //! Long ops (plan, run) report via `Progress` over an mpsc sender
 //! and return an exit code; short ops (set_gate, commit) return a message.
 
-mod land;
-mod plan;
-mod run;
+pub mod land;
+pub mod plan;
+pub mod run;
 
 pub use land::*;
 pub use plan::*;
@@ -104,6 +104,6 @@ fn read_patches(run_dir: &Path) -> Result<(String, String)> {
 /// over, what the landing re-digests, and what `git apply` receives. All three
 /// have to agree byte for byte or an approval binds to something nobody read,
 /// so they read it from here rather than each spelling out the same `format!`.
-fn combined(tests_patch: &str, impl_patch: &str) -> String {
+pub fn combined(tests_patch: &str, impl_patch: &str) -> String {
     format!("{tests_patch}\n{impl_patch}")
 }

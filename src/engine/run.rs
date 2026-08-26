@@ -4,7 +4,7 @@ use super::*;
 /// tier split (e.g. opus reviewing sonnet) is guvnor's only decorrelation in a
 /// single-vendor setup; if both seats are the same model the review is the
 /// author grading its own homework.
-fn decorrelation_warning(cfg: &Config) -> Option<String> {
+pub fn decorrelation_warning(cfg: &Config) -> Option<String> {
     if cfg.claude.model_reviewer == cfg.claude.model_worker {
         Some(format!(
             "⚠ reviewer and worker are the same model ({}) — the review is the author grading its own work; set a stronger [claude] model_reviewer",
@@ -23,7 +23,7 @@ fn decorrelation_warning(cfg: &Config) -> Option<String> {
 /// Unconditional: no flag disables it. A spec change big enough that the old
 /// implementation actively misleads costs one rework round to discover, and
 /// the bounded rework loop already exists to absorb exactly that.
-fn seed_impl(wt_impl: &Path, run_dir: &Path, tests_patch: &str) -> bool {
+pub fn seed_impl(wt_impl: &Path, run_dir: &Path, tests_patch: &str) -> bool {
     let Ok(prev) = std::fs::read_to_string(run_dir.join("impl.patch")) else { return false };
     if prev.trim().is_empty() {
         return false;
@@ -483,7 +483,7 @@ fn review_and_finish(
 /// True when every ticked finding names a test-file path and there is nothing
 /// else to act on. The fix lane runs on base + impl.patch and never sees (or may
 /// touch) the tests, so a round aimed only at test files can only no-op.
-fn all_findings_are_tests(findings: &[review::Finding], tests: &[String]) -> bool {
+pub fn all_findings_are_tests(findings: &[review::Finding], tests: &[String]) -> bool {
     !findings.is_empty()
         && findings
             .iter()
@@ -695,83 +695,3 @@ pub fn fix(
 /// advice cannot drift apart about what state the run is in.
 const BROKE_TAIL: &str =
     "the fix regressed the suite; it was thrown away and impl.patch on disk is unchanged";
-
-#[cfg(test)]
-mod amend_tests {
-    use super::seed_impl;
-
-    /// The amend path: re-running after a spec revision reuses the previous
-    /// implementation rather than paying for a cold pass. Every reason it can't
-    /// must fall back to cold, never fail — a bad seed is not a bad run.
-    #[test]
-    fn seeding_falls_back_to_cold_rather_than_failing() {
-        let dir = std::env::temp_dir().join(format!("guvnor-seed-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        let (run, wt) = (dir.join("run"), dir.join("wt"));
-        std::fs::create_dir_all(&run).unwrap();
-        std::fs::create_dir_all(&wt).unwrap();
-        crate::git::init_test_repo(&wt);
-        crate::git::ensure_baseline_commit(&wt).unwrap();
-
-        // nothing to seed from
-        assert!(!seed_impl(&wt, &run, ""));
-        std::fs::write(run.join("impl.patch"), "").unwrap();
-        assert!(!seed_impl(&wt, &run, ""), "an empty patch is not a seed");
-
-        let patch = "diff --git a/src/a.js b/src/a.js\nnew file mode 100644\n--- /dev/null\n+++ b/src/a.js\n@@ -0,0 +1 @@\n+ok\n";
-        std::fs::write(run.join("impl.patch"), patch).unwrap();
-        // the new tests now own a file the old implementation created: seeding
-        // would make the two patches non-composable and fail as if the
-        // implementer had misbehaved, which is a lie about what happened
-        assert!(!seed_impl(&wt, &run, patch), "overlap must start cold, not fail");
-        // clean seed lands, and the file is really in the tree
-        assert!(seed_impl(&wt, &run, "diff --git a/t/x b/t/x\n--- /dev/null\n+++ b/t/x\n"));
-        assert_eq!(std::fs::read_to_string(wt.join("src/a.js")).unwrap(), "ok\n");
-        // a patch that no longer applies (already applied) also goes cold
-        assert!(!seed_impl(&wt, &run, ""));
-        std::fs::remove_dir_all(&dir).ok();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::{Claude, Commands, Limits, Paths};
-
-    fn cfg_with(worker: &str, reviewer: &str) -> Config {
-        Config {
-            commands: Commands { test: "true".into() },
-            paths: Paths { tests: vec!["test/".into()], src: vec!["src/".into()] },
-            claude: Claude {
-                bin: "claude".into(),
-                model_planner: "opus".into(),
-                model_worker: worker.into(),
-                model_reviewer: reviewer.into(),
-            },
-            limits: Limits::default(),
-        }
-    }
-
-    #[test]
-    fn decorrelation_warning_fires_only_when_seats_match() {
-        assert!(decorrelation_warning(&cfg_with("sonnet", "opus")).is_none());
-        let w = decorrelation_warning(&cfg_with("sonnet", "sonnet")).unwrap();
-        assert!(w.contains("sonnet"));
-    }
-
-    #[test]
-    fn a_fix_round_of_only_test_findings_is_a_dead_end() {
-        let f = |file: &str| review::Finding {
-            severity: review::Severity::Low,
-            file: file.into(),
-            note: "n".into(),
-        };
-        let tests = vec!["test/".into()];
-        // every finding under the tests prefix, nothing else to do → dead end
-        assert!(all_findings_are_tests(&[f("test/readme.test.js")], &tests));
-        // one implementation finding is enough to give the lane real work
-        assert!(!all_findings_are_tests(&[f("test/a.test.js"), f("src/x.js")], &tests));
-        // no findings at all is not a test-only round (an instruction may carry it)
-        assert!(!all_findings_are_tests(&[], &tests));
-    }
-}
