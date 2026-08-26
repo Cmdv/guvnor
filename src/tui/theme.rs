@@ -3,11 +3,13 @@
 
 use crate::review::Severity;
 use crate::state::Status;
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType,
 };
+use ratatui::Frame;
 
 pub const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -121,6 +123,109 @@ pub fn focus_box(key: &str, title: &str, focused: bool) -> Block<'static> {
         .border_style(Style::new().fg(border))
         .title_style(Style::new().fg(border))
         .title(box_title(&format!("{mark}{title}"), key, text, false))
+}
+
+/// Wall x-positions for `labels`, starting at `start`: n+1 walls for n tabs,
+/// each tab's own left wall plus one closing wall at the end. Shared by
+/// [`tab_strip_width`] and [`tab_strip`] so they agree on where a tab sits.
+fn wall_xs(start: u16, labels: &[Line<'_>]) -> Vec<u16> {
+    let mut xs = vec![start];
+    for l in labels {
+        let prev = *xs.last().unwrap();
+        xs.push(prev + 1 + l.width() as u16 + 2);
+    }
+    xs
+}
+
+/// Total width [`tab_strip`] needs for `labels`. Call this first to size the
+/// area you hand it.
+pub fn tab_strip_width(labels: &[Line<'_>]) -> u16 {
+    *wall_xs(0, labels).last().unwrap()
+}
+
+/// A row of flush, individually-boxed tabs whose baseline stitches into
+/// whatever the caller drew at `area.y + area.height` (normally that box's
+/// own top border). Only that one row changes, only in the tab columns.
+/// The active tab's walls curl into rounded jambs, opening into the box
+/// below; every other wall meets the baseline as a junction. Call this
+/// after the content below is drawn, or its border paints over the notch.
+///
+/// Returns each tab's cell (border + label rows), in `labels` order.
+/// [`hit_test`](super::hit_test) shares this geometry, so a click can't
+/// target something different from what's drawn. A tab that doesn't fit
+/// `area.width` is left undrawn and dropped from the return, like `Buttons`
+/// going quiet past its own edge.
+pub fn tab_strip(f: &mut Frame, area: Rect, labels: &[Line<'_>], active: usize) -> Vec<Rect> {
+    if area.height == 0 || labels.is_empty() {
+        return Vec::new();
+    }
+    let xs = wall_xs(area.x, labels);
+    let right = area.x + area.width;
+    let n = xs.iter().skip(1).take_while(|&&x| x <= right).count();
+    let xs = &xs[..=n];
+    // `+ 1`: a cell spans its own left wall through the wall shared with
+    // the next cell. Without it, that wall gets drawn twice: once here one
+    // column short, again as the next cell's left wall.
+    let cells: Vec<Rect> = (0..n)
+        .map(|k| Rect { x: xs[k], y: area.y, width: xs[k + 1] - xs[k] + 1, height: area.height.min(2) })
+        .collect();
+    let border = Style::new().fg(MODAL_BORDER);
+    let buf = f.buffer_mut();
+    for (k, cell) in cells.iter().enumerate() {
+        for x in cell.x..cell.x + cell.width {
+            let sym = if x == cell.x && k == 0 {
+                "╭"
+            } else if x == cell.x + cell.width - 1 && k == n - 1 {
+                "╮"
+            } else if x == cell.x || x == cell.x + cell.width - 1 {
+                "┬"
+            } else {
+                "─"
+            };
+            buf[(x, area.y)].set_symbol(sym).set_style(border);
+        }
+        if area.height > 1 {
+            let y = area.y + 1;
+            buf[(cell.x, y)].set_symbol("│").set_style(border);
+            buf[(cell.x + cell.width - 1, y)].set_symbol("│").set_style(border);
+            // Centred: `wall_xs` pads the interior by 2, so one spare column
+            // always sits on each side of the label.
+            let label_w = labels[k].width() as u16;
+            let pad = cell.width.saturating_sub(2).saturating_sub(label_w) / 2;
+            buf.set_line(cell.x + 1 + pad, y, &labels[k], label_w);
+            // Same flat fill `Tabs::highlight_style` gave the selected
+            // label. Patched on top, so the marks/text stay, just recoloured.
+            if k == active {
+                let text_a =
+                    Rect { x: cell.x + 1, y, width: cell.width.saturating_sub(2), height: 1 };
+                buf.set_style(text_a, Style::new().bg(Color::White).fg(Color::Black).bold());
+            }
+        }
+    }
+    if area.height > 1 {
+        let seam_y = area.y + area.height;
+        for (w, &x) in xs.iter().enumerate() {
+            // Rounded jambs (`╯` `╰`), matching the app's corners elsewhere.
+            // Except `w == 0`: that's also the content box's own left
+            // corner, nothing to curl away from, so it stays a plain drop.
+            let sym = if w == 0 {
+                if w == active { "│" } else { "├" }
+            } else if w == active {
+                "╯"
+            } else if w == active + 1 {
+                "╰"
+            } else {
+                "┴"
+            };
+            buf[(x, seam_y)].set_symbol(sym).set_style(border);
+        }
+        if let Some(cell) = cells.get(active) {
+            for x in cell.x + 1..cell.x + cell.width - 1 {
+                buf[(x, seam_y)].set_symbol(" ");
+            }
+        }
+    }
+    cells
 }
 
 /// Colour art per cell class, art string untouched: `░` cells render as solid
@@ -406,6 +511,83 @@ mod tests {
         let r = status_badge(&failed("rejected_work"));
         assert_eq!(r.style.bg, Some(Color::Yellow));
         assert_eq!(r.content, " rejected: work ");
+    }
+
+    #[test]
+    fn tab_strip_width_matches_the_wall_math_it_shares_with_tab_strip() {
+        // one tab: its own left wall (1) + " Spec " (6) = 7
+        assert_eq!(tab_strip_width(&[Line::raw("Spec")]), 7);
+        // two tabs share the middle wall, so it's not counted twice
+        assert_eq!(tab_strip_width(&[Line::raw("Spec"), Line::raw("Tests")]), 7 + 1 + 7);
+    }
+
+    /// Opens under the active tab (rounded jambs, blank interior), a
+    /// junction under every inactive one, and a plain drop where a wall
+    /// lands on the content box's own left corner.
+    #[test]
+    fn tab_strip_opens_under_the_active_tab_and_returns_click_geometry() {
+        use ratatui::backend::TestBackend;
+        use ratatui::widgets::Paragraph;
+        use ratatui::Terminal;
+        let labels = vec![Line::raw("Spec"), Line::raw("Tests"), Line::raw("Work")];
+        let mut cells = Vec::new();
+        let mut t = Terminal::new(TestBackend::new(40, 6)).unwrap();
+        t.draw(|f| {
+            // drawn first: the strip's seam must overwrite this border, not
+            // the reverse.
+            f.render_widget(
+                Paragraph::new("").block(boxed("body", Style::new())),
+                Rect::new(0, 2, 40, 4),
+            );
+            cells = tab_strip(f, Rect::new(0, 0, 40, 2), &labels, 1); // "Tests" active
+        })
+        .unwrap();
+        assert_eq!(cells.len(), 3, "one cell per label");
+        assert_eq!((cells[0].y, cells[0].height), (0, 2), "border + label rows");
+        assert_eq!(cells[1].x, 7, "Tests starts right after Spec's wall");
+
+        let buf = t.backend().buffer().clone();
+        // by column, not byte: box-drawing glyphs are multi-byte and a
+        // sliced String would cut one in half.
+        let sym = |x: u16, y: u16| buf[(x, y)].symbol().to_string();
+        let row: Vec<String> = (0..40).map(|x| sym(x, 2)).collect();
+        assert_eq!(sym(0, 2), "├", "left edge joins the box below, not a plain corner: {row:?}");
+        assert_eq!(sym(7, 2), "╯", "Tests' own left wall curls into a jamb: {row:?}");
+        assert_eq!(sym(9, 2), " ", "and its interior is an open doorway: {row:?}");
+        assert_eq!(sym(15, 2), "╰", "Tests' own right wall curls into a jamb: {row:?}");
+        assert_eq!(sym(22, 2), "┴", "an inactive wall meets the baseline as a junction: {row:?}");
+        // a shared wall is one column, not two: Spec's right wall and
+        // Tests' left wall must both land on x=7, no stray second one at 8.
+        assert_eq!(sym(7, 0), "┬", "one junction, not a pair either side of it");
+        assert_eq!(sym(8, 0), "─", "no second junction beside it");
+        assert_eq!(sym(7, 1), "│", "one wall, not a pair either side of it");
+        assert_eq!(sym(9, 1), "T", "Tests' label starts right after its own pad");
+        // the active tab gets the same flat highlight `Tabs` gave the
+        // selected label, patched onto the label, not the border.
+        assert_eq!(buf[(9, 1)].style().bg, Some(Color::White), "active tab is highlighted");
+        assert_eq!(buf[(9, 1)].style().fg, Some(Color::Black));
+        assert_ne!(buf[(2, 1)].style().bg, Some(Color::White), "an inactive tab keeps its own colour");
+    }
+
+    /// The exception the rule above carves out: an active tab's left wall,
+    /// when it's also the group's leftmost, has nothing to curl away from.
+    #[test]
+    fn the_first_tab_stays_a_plain_drop_when_active() {
+        use ratatui::backend::TestBackend;
+        use ratatui::widgets::Paragraph;
+        use ratatui::Terminal;
+        let labels = vec![Line::raw("Spec"), Line::raw("Tests")];
+        let mut t = Terminal::new(TestBackend::new(40, 6)).unwrap();
+        t.draw(|f| {
+            f.render_widget(
+                Paragraph::new("").block(boxed("body", Style::new())),
+                Rect::new(0, 2, 40, 4),
+            );
+            tab_strip(f, Rect::new(0, 0, 40, 2), &labels, 0); // "Spec" active
+        })
+        .unwrap();
+        let buf = t.backend().buffer().clone();
+        assert_eq!(buf[(0, 2)].symbol(), "│", "no jamb to curl into on the left edge");
     }
 
 }

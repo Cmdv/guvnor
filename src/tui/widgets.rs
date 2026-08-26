@@ -3,7 +3,7 @@
 //! its content ends.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
@@ -590,6 +590,13 @@ pub fn scrolled(s: &mut Scroll, d: i32) -> Option<Go> {
     None
 }
 
+/// Which cell contains `pos`, if any. One hit-test for every clickable row
+/// of rects: `tab_strip`'s cells today, `Buttons` and list rows next. Reuses
+/// whatever geometry the render pass already produced.
+pub fn hit_test(cells: &[Rect], pos: Position) -> Option<usize> {
+    cells.iter().position(|r| r.contains(pos))
+}
+
 /// Put text on the system clipboard. No dependency: every desktop ships a
 /// tool that reads stdin, and the terminal is the wrong place to reimplement
 /// one. First tool that exists wins; with none installed, falls back to
@@ -666,6 +673,18 @@ pub fn press(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, ratatui::crossterm::event::KeyModifiers::NONE)
 }
 
+/// A bare left-click at `(col, row)`. Mirrors `press` for mouse-driven tests.
+#[cfg(test)]
+pub fn click(col: u16, row: u16) -> ratatui::crossterm::event::MouseEvent {
+    use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+    ratatui::crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: col,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
 /// A rendered buffer as text, rows joined with newlines — the screen dump the
 /// render tests grep. (`theme` and `text` are leaves and keep local copies.)
 #[cfg(test)]
@@ -692,6 +711,16 @@ pub fn lines_text(lines: &[Line<'_>]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hit_test_finds_the_cell_under_a_point_or_none() {
+        let cells = [Rect::new(0, 0, 5, 2), Rect::new(5, 0, 5, 2)];
+        assert_eq!(hit_test(&cells, Position::new(2, 1)), Some(0));
+        assert_eq!(hit_test(&cells, Position::new(7, 0)), Some(1));
+        // out of bounds both ways. No hit either way.
+        assert_eq!(hit_test(&cells, Position::new(2, 5)), None);
+        assert_eq!(hit_test(&cells, Position::new(20, 0)), None);
+    }
 
     #[test]
     fn hang_wrap_keeps_continuations_under_the_marker() {

@@ -9,7 +9,7 @@ use ratatui::layout::{Constraint, Flex, Layout, Position, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Clear, Paragraph, Tabs, Wrap,
+    Clear, Paragraph, Wrap,
 };
 use ratatui::Frame;
 
@@ -112,6 +112,10 @@ pub struct CaseView {
     /// has happened yet. Everything in `shown` and not in `live` is greyed: it
     /// says what is coming without pretending to be reachable.
     pub shown: Vec<usize>,
+    /// Each shown tab's on-screen cell, from the last render. `shown[k]` is
+    /// the tab `tab_cells[k]` draws; a click reuses this, so it can't target
+    /// something different from what's drawn. Empty until the first frame.
+    pub tab_cells: Vec<Rect>,
     /// Failure evidence + what to do about it. `None` = the run never failed.
     pub fail: Option<Vec<Line<'static>>>,
     /// The spec was revised after these patches were cut, so the Tests and Work
@@ -148,6 +152,15 @@ impl CaseView {
                 self.scroll.top();
                 return;
             }
+        }
+    }
+
+    /// Jump straight to tab `t`: a click's counterpart to `step`'s relative
+    /// move. A greyed tab is a no-op, same as the keyboard.
+    pub fn goto(&mut self, t: usize) {
+        if self.live.contains(&t) {
+            self.tab = t;
+            self.scroll.top();
         }
     }
 }
@@ -308,6 +321,7 @@ impl App {
             next,
             live,
             shown,
+            tab_cells: Vec::new(),
             superseded,
             spec_lines: spec_tab,
             diffs: [tests_diff, work_diff],
@@ -322,11 +336,14 @@ impl App {
         })
     }
 
-    pub fn render_case(&self, f: &mut Frame, area: Rect) {
-        let Screen::Case(v) = &self.screen else { return };
+    pub fn render_case(&mut self, f: &mut Frame, area: Rect) {
+        let Screen::Case(v) = &mut self.screen else { return };
         let has_note = v.note.is_some();
+        // 2 rows, not 3: the strip's own bottom border is gone. The body
+        // box's top border, stitched by `tab_strip` below, is now the only
+        // line between them.
         let [top_a, body_a, note_a] = Layout::vertical([
-            Constraint::Length(3),
+            Constraint::Length(2),
             Constraint::Min(3),
             Constraint::Length(if has_note { 3 } else { 0 }),
         ])
@@ -355,16 +372,9 @@ impl App {
                 Line::from(vec![mark, Span::raw(TABS[i])])
             })
             .collect();
-        let tabs_w = labels.iter().map(|l| l.width() as u16 + 3).sum::<u16>() + 1;
+        let tabs_w = tab_strip_width(&labels);
         let [tabs_a, info_a] =
             Layout::horizontal([Constraint::Length(tabs_w), Constraint::Min(0)]).areas(top_a);
-        f.render_widget(
-            Tabs::new(labels)
-                .select(v.tab_pos())
-                .highlight_style(Style::new().bg(Color::White).fg(Color::Black).bold())
-                .block(boxed("", Style::new())),
-            tabs_a,
-        );
         // One row, three things: the run's name from the left, the status
         // hard right so it never moves when the title does, and what to do next
         // in the gap between them. Two passes plus a sub-rect is cheaper than a
@@ -388,40 +398,48 @@ impl App {
         };
         f.render_widget(Paragraph::new(v.next.clone()).wrap(Wrap { trim: true }), gap);
         match (v.tab, &v.review) {
-            // The report brings its own boxes; a wrapper round them would be a
-            // third border deep for nothing.
-            (REVIEW_TAB, Some(r)) => render_review_tab(f, body_a, r),
+            (REVIEW_TAB, Some(r)) => {
+                // Outer box, untitled, like Spec/Tests/Work: gives the seam
+                // a title-free row to land on. The report's own boxes
+                // (verdict, findings, cost) sit inset below with their own
+                // titles.
+                let block = boxed("", Style::new());
+                let inner = block.inner(body_a);
+                f.render_widget(block, body_a);
+                render_review_tab(f, inner, r);
+            }
             (FAIL_TAB, _) => {
-                let block = boxed("Failure", Style::new().fg(Color::Red).bold())
-                    .border_style(Style::new().fg(Color::Red))
-                    .title_style(Style::new().fg(Color::Red));
+                // No title: this border is the row the strip shares. The
+                // tab's own red ✖ mark already says "broken".
+                let block = boxed("", Style::new()).border_style(Style::new().fg(Color::Red));
                 let inner = block.inner(body_a);
                 let lines = v.fail.clone().unwrap_or_default();
                 let body = Paragraph::new(lines).wrap(Wrap { trim: false });
                 let off = v.scroll.fit(body.line_count(inner.width), inner.height);
                 f.render_widget(body.scroll((off, 0)).block(block), body_a);
             }
+            // No title: same shared-seam row as every other body box.
             (REVIEW_TAB, None) => f.render_widget(
                 Paragraph::new(Line::styled(
                     " not reviewed yet — the reviewer runs at the end of a run",
                     Style::new().fg(Color::DarkGray),
                 ))
-                .block(boxed("Review", Style::new().bold())),
+                .block(boxed("", Style::new())),
                 body_a,
             ),
             _ => {
                 let stale = v.superseded && v.tab > 0;
-                let title = match (v.approved[v.tab], stale) {
-                    (_, true) => format!("{} — from a superseded spec, re-run (r)", TABS[v.tab]),
-                    (true, _) => format!("{} — approved", TABS[v.tab]),
-                    (false, _) => format!("{} — ↵ to judge", TABS[v.tab]),
-                };
-                let style = if stale {
-                    Style::new().fg(Color::Yellow).bold()
+                // No title: it used to spell out "approved" / "↵ to judge" /
+                // "from a superseded spec, re-run (r)", but that text sits on
+                // the row the strip's seam shares, and collides with a wall.
+                // The tab's own mark (✓ ✖ · ⚠) says the same thing, and
+                // `next_step` above names the key.
+                let block = boxed("", Style::new());
+                let block = if stale {
+                    block.border_style(Style::new().fg(Color::Yellow))
                 } else {
-                    Style::new().bold()
+                    block
                 };
-                let block = boxed(&title, style);
                 // The diff tabs carry their own keys: the strip's hints are
                 // about the run, these are about the list in front of you.
                 let block = match v.tab {
@@ -448,6 +466,11 @@ impl App {
                 }
             }
         }
+        // Drawn last, so its seam overwrite lands on top of the content
+        // box's own top border. Reads as one frame with a notch, not two
+        // stacked. Cached for the next click's hit-test.
+        let tab_pos = v.tab_pos();
+        v.tab_cells = tab_strip(f, tabs_a, &labels, tab_pos);
         if let Some((ask, buttons)) = &v.confirm {
             // The gate ask needs no words — the tab you're on and the two verbs
             // say it. The re-run ask does: it is not an undo.
@@ -586,6 +609,7 @@ mod tests {
             review_mark: Span::raw(""),
             live,
             shown,
+            tab_cells: Vec::new(),
             fail: None,
             superseded: false,
             confirm: None,
@@ -861,6 +885,34 @@ mod tests {
         // the gate array is indexed by tab: the rest must sit past its end
         assert_eq!(REVIEW_TAB, 3);
         assert_eq!(FAIL_TAB, TABS.len() - 1);
+    }
+
+    /// A click hits exactly what render drew: `tab_cells` is that same
+    /// geometry, not a guess from label widths. A tab that hasn't happened
+    /// yet is a no-op, same as `step`'s keyboard move.
+    #[test]
+    fn clicking_a_tab_selects_it_and_a_greyed_one_is_a_no_op() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        // Spec and Tests exist; Work and Review are drawn but not live yet.
+        let mut app = App::for_test();
+        app.screen = Screen::Case(Box::new(view(vec![0, 1], vec![0, 1, 2, REVIEW_TAB])));
+        let (w, h) = (100, 24);
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| app.render_case(f, Rect::new(0, 0, w, h))).unwrap();
+        let Screen::Case(v) = &app.screen else { unreachable!() };
+        assert_eq!(v.tab_cells.len(), 4, "one cell per shown tab");
+        let (tests_cell, work_cell) = (v.tab_cells[1], v.tab_cells[2]);
+
+        // clicking the live "Tests" cell selects it
+        app.handle_mouse(&click(tests_cell.x + 1, tests_cell.y + 1));
+        let Screen::Case(v) = &app.screen else { unreachable!() };
+        assert_eq!(v.tab, 1, "the click landed on Tests");
+
+        // clicking the greyed "Work" cell does nothing. Never a destination.
+        app.handle_mouse(&click(work_cell.x + 1, work_cell.y + 1));
+        let Screen::Case(v) = &app.screen else { unreachable!() };
+        assert_eq!(v.tab, 1, "a greyed tab is not a click target either");
     }
 
 }

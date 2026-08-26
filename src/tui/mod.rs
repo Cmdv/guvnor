@@ -86,12 +86,15 @@ fn hand_back_on_panic() {
 /// thread and does not know about the keyboard flags. `hand_back_on_panic` owns
 /// that job.
 fn enter() -> DefaultTerminal {
-    use ratatui::crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
+    use ratatui::crossterm::event::{
+        EnableMouseCapture, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    };
     use ratatui::crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
     enable_raw_mode().expect("enable raw mode");
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
         EnterAlternateScreen,
+        EnableMouseCapture,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     );
     ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
@@ -99,10 +102,12 @@ fn enter() -> DefaultTerminal {
 }
 
 /// Give it back. Paired with `enter`, because the keyboard flags outlive the
-/// alt screen and a shell that inherits them gets strange keys.
+/// alt screen and a shell that inherits them gets strange keys. A mouse left
+/// captured also stops a plain drag from selecting text.
 fn leave() {
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
+        ratatui::crossterm::event::DisableMouseCapture,
         ratatui::crossterm::event::PopKeyboardEnhancementFlags
     );
     ratatui::restore();
@@ -392,24 +397,32 @@ impl App {
             if !event::poll(Duration::from_millis(120))? {
                 continue;
             }
-            let Event::Key(key) = event::read()? else { continue };
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            match self.handle_key(&key) {
-                Some(Go::Quit) => return Ok(()),
-                Some(Go::Edit(id, path)) => {
-                    leave();
-                    edit_in_editor(&path);
-                    *terminal = enter();
-                    terminal.clear()?;
-                    if let Err(e) = Spec::load(&path) {
-                        self.toast = toast(format!("spec invalid after edit: {e:#}"));
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    match self.handle_key(&key) {
+                        Some(Go::Quit) => return Ok(()),
+                        Some(Go::Edit(id, path)) => {
+                            leave();
+                            edit_in_editor(&path);
+                            *terminal = enter();
+                            terminal.clear()?;
+                            if let Err(e) = Spec::load(&path) {
+                                self.toast = toast(format!("spec invalid after edit: {e:#}"));
+                            }
+                            self.apply(Go::CaseTab(id, 0));
+                        }
+                        Some(go) => self.apply(go),
+                        None => {}
                     }
-                    self.apply(Go::CaseTab(id, 0));
                 }
-                Some(go) => self.apply(go),
-                None => {}
+                // Only the Case screen's tab strip answers today. Every
+                // other screen is a deliberate `None` in `handle_mouse`.
+                Event::Mouse(m) => {
+                    if let Some(go) = self.handle_mouse(&m) {
+                        self.apply(go);
+                    }
+                }
+                _ => {}
             }
         }
     }

@@ -4,7 +4,10 @@
 use crate::engine::{self};
 use crate::state::{self};
 use crate::lane;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Position;
 
 use super::*;
 
@@ -447,6 +450,21 @@ impl App {
             }
             Screen::Landed { .. } => Some(Go::Runs),
         }
+    }
+
+    /// Mirrors `handle_key`, for clicks. Only the Case screen's tab strip
+    /// answers today; everything else is a deliberate `None`.
+    pub fn handle_mouse(&mut self, m: &MouseEvent) -> Option<Go> {
+        if m.kind != MouseEventKind::Down(MouseButton::Left) {
+            return None;
+        }
+        let pos = Position::new(m.column, m.row);
+        if let Screen::Case(v) = &mut self.screen {
+            if let Some(k) = hit_test(&v.tab_cells, pos) {
+                v.goto(v.shown[k]);
+            }
+        }
+        None
     }
 
     /// Keys for the new-feature panel while it holds focus. Tab walks title →
