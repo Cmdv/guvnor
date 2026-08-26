@@ -240,6 +240,17 @@ fn staging_lands_in_your_tree_and_stops_there() {
     std::fs::remove_dir_all(&repo).ok();
 }
 
+/// An untracked scratch file is none of the patch's business, so it must not
+/// dirty the tree for staging — same tolerance `write-tree` already gives it.
+#[test]
+fn an_untracked_file_does_not_block_staging() {
+    let (repo, id) = fixture("untracked");
+    std::fs::write(repo.join("scratch.txt"), "notes\n").unwrap();
+    assert!(stage_at(&repo, &id).is_ok(), "untracked file must not block staging");
+    assert_eq!(status(&repo, &id), Status::Staged);
+    std::fs::remove_dir_all(&repo).ok();
+}
+
 /// Guvnor signs what a reviewer read. Once you have edited the staged
 /// change it is your work, and both of guvnor's next moves refuse it.
 #[test]

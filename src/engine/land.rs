@@ -59,7 +59,10 @@ pub fn set_gate_at(
 /// Returns the two patches, in the order they apply. Reads only.
 fn commit_checks(repo: &Path, run_dir: &Path, st: &State) -> Result<(String, String)> {
     let (tests_patch, impl_patch) = approval_checks(run_dir, st)?;
-    let status = git::git(repo, &["status", "--porcelain"])?;
+    // Untracked files are ignored, same as `write-tree` in `index_tree`: a scratch
+    // file that isn't part of any patch can't collide with one, so it can't dirty
+    // the tree for our purposes.
+    let status = git::git(repo, &["status", "--porcelain", "--untracked-files=no"])?;
     if !status.trim().is_empty() {
         bail!("main repo tree is dirty; commit or stash first");
     }
@@ -224,7 +227,10 @@ pub fn stage_at(repo: &Path, id: &str) -> Result<String> {
     // Staged, but the index no longer hashes to what we put there. If the tree
     // came back clean you reset it away, and staging afresh is exactly right;
     // anything still in there is yours now, and not ours to overwrite.
-    if st.status == Status::Staged && !git::git(repo, &["status", "--porcelain"])?.trim().is_empty()
+    if st.status == Status::Staged
+        && !git::git(repo, &["status", "--porcelain", "--untracked-files=no"])?
+            .trim()
+            .is_empty()
     {
         bail!("{DRIFTED}");
     }
