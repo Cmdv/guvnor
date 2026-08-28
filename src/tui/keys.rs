@@ -380,17 +380,22 @@ impl App {
                 let Screen::Case(v) = &mut self.screen else { return None };
                 match key.code {
                     KeyCode::Esc => Some(Go::Runs),
-                    KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+                    // The tab strip is ←/→ (h/l) only — tab is for focus, never
+                    // for the strip, or it would mean two different things
+                    // depending which screen you were on.
+                    KeyCode::Right | KeyCode::Char('l') => {
                         v.step(1);
                         None
                     }
-                    KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+                    KeyCode::Left | KeyCode::Char('h') => {
                         v.step(-1);
                         None
                     }
                     // On the Spec tab the boxes own the arrows and the digits:
                     // each one scrolls its own content, so there is no single
-                    // body scroll to drive.
+                    // body scroll to drive. Tab/backtab walk the six boxes in
+                    // order — the digits' next/prev, for the same reason the
+                    // Review tab's sections have one.
                     _ if v.tab == 0 && v.spec.is_some() && v.panels.handle(key) => None,
                     // Tests and Work are file lists: the cursor and the fold are
                     // theirs, everything else falls through to the run's keys.

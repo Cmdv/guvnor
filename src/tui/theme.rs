@@ -51,6 +51,12 @@ pub const ART_SHADE: Color = Color::Rgb(0x3a, 0x41, 0x50);
 
 pub const ART_WHITE: Color = Color::Rgb(0xea, 0xea, 0xea);
 
+/// A darker tone of [`ART_WHITE`], for de-emphasised text on the selected run
+/// row: the bar itself stays a fixed fill, so anything meant to read as
+/// muted against it needs its own fixed, darker grey rather than a
+/// terminal-palette colour that might not sit under it correctly.
+pub const SELECTED_TEXT: Color = Color::Rgb(0x29, 0x29, 0x29);
+
 /// Every modal wears the same chrome: one dark grey fill, one border colour.
 /// Colour inside a modal means something (button accent, severity, danger) —
 /// it is never used to tell one modal apart from another.

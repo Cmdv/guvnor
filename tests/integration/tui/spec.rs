@@ -96,3 +96,20 @@ fn a_number_picks_a_box_and_the_arrows_scroll_that_one() {
         assert!(!p.handle(&press(KeyCode::Char(c))), "{c} must pass through");
     }
 }
+
+/// Tab/backtab are the digits' next/prev: the same six boxes, walked in
+/// order instead of jumped to, wrapping at both ends so it is a cycle rather
+/// than a dead stop.
+#[test]
+fn tab_and_backtab_walk_the_boxes_in_order_and_wrap() {
+    let mut p = SpecPanels::default();
+    assert_eq!(p.focus, 0);
+    for want in [1, 2, 3, 4, 5, 0] {
+        assert!(p.handle(&press(KeyCode::Tab)));
+        assert_eq!(p.focus, want);
+    }
+    for want in [5, 4, 3, 2, 1, 0] {
+        assert!(p.handle(&press(KeyCode::BackTab)));
+        assert_eq!(p.focus, want);
+    }
+}

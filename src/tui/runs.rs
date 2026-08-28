@@ -211,18 +211,11 @@ impl App {
         } else {
             let running = self.job.as_ref().and_then(|j| j.run_id.clone());
             let sel = self.table.selected();
-            // On the selected row: a chip (a span that carries a background)
-            // keeps its colour but gets light-grey letters, so it reads as
-            // selected too; bare text (the verdict, the gate dividers, the
-            // muted "not yet" chips) takes the row's black. Off the bar, spans
-            // are as-is.
-            let recolour = |s: Style| {
-                if s.bg.is_some() {
-                    s.fg(Color::Gray)
-                } else {
-                    s.fg(Color::Black)
-                }
-            };
+            // On the selected row, every gates span — chip or bare divider,
+            // background or not — takes one darker tone of the bar's own
+            // fill, so it reads as de-emphasised without falling back to a
+            // terminal-palette grey that might not sit right on ART_WHITE.
+            let recolour = |s: Style| s.fg(SELECTED_TEXT);
             // pad every status chip to the widest shown, so the coloured blocks
             // line up in a column instead of leaving a ragged gap. One badge per
             // row, built once: the width pass and the row pass read the same spans.
@@ -247,10 +240,10 @@ impl App {
                     };
                     let mut gates = r.gates.clone();
                     if selected {
-                        // the chip keeps its background; only its letters grey out
-                        if status.style.bg.is_some() {
-                            status.style = status.style.fg(Color::Gray);
-                        }
+                        // the chip (or padded badge, or running spinner) keeps
+                        // its own background; only its letters take the
+                        // bar's darker tone.
+                        status.style = status.style.fg(SELECTED_TEXT);
                         for span in &mut gates.spans {
                             span.style = recolour(span.style);
                         }

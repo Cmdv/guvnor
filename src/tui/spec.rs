@@ -42,12 +42,21 @@ pub struct SpecPanels {
 }
 
 impl SpecPanels {
-    /// `1`-`6` jump, arrows scroll the box they land on. Returns whether the key
-    /// was ours, so the caller can pass on the ones that aren't.
+    /// `1`-`6` jump, tab/backtab walk to the next/previous box, arrows scroll
+    /// the box they land on. Returns whether the key was ours, so the caller
+    /// can pass on the ones that aren't.
     pub fn handle(&mut self, key: &KeyEvent) -> bool {
         match key.code {
             KeyCode::Char(c @ '1'..='6') => {
                 self.focus = c as usize - '1' as usize;
+                true
+            }
+            KeyCode::Tab => {
+                self.focus = (self.focus + 1) % 6;
+                true
+            }
+            KeyCode::BackTab => {
+                self.focus = (self.focus + 5) % 6;
                 true
             }
             KeyCode::Down | KeyCode::Char('j') => {

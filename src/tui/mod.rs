@@ -594,11 +594,18 @@ impl App {
                 _ => self.toast = toast(format!("run failed [{why}] — open it for evidence")),
             },
             // An `Err` return is a precondition, not a lane outcome: nothing ran,
-            // nothing is on disk, and the message is one actionable line.
+            // nothing is on disk, and the message is one actionable line. Land
+            // back on Review — same as a successful Run/Fix above — rather than
+            // the run list; it falls back to tab 0 itself if Review isn't live
+            // yet, so there's no reason a rejected precondition should cost you
+            // the run you were looking at.
             (_, Outcome::Error(e)) => {
                 self.toast = toast(e);
                 if on_progress {
-                    self.apply(Go::Runs);
+                    match job.run_id {
+                        Some(id) => self.apply(Go::CaseTab(id, REVIEW_TAB)),
+                        None => self.apply(Go::Runs),
+                    }
                 }
             }
         }

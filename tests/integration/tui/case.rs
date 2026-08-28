@@ -184,6 +184,32 @@ fn stepping_the_strip_only_visits_live_tabs() {
     assert_eq!(v.tab_pos(), 1);
 }
 
+/// `tab` used to double as a third way to step the strip, alongside ←/→ and
+/// h/l. That meant it did two different things depending on the screen — the
+/// strip moves on ←/→ (h/l) only now, and tab is free for focus everywhere,
+/// even on a tab (like Tests) with no boxes to focus, where it is simply a
+/// no-op rather than a hidden way to change tabs.
+#[test]
+fn tab_never_steps_the_strip_only_arrows_do() {
+    use ratatui::crossterm::event::KeyCode;
+    let mut app = App::for_test();
+    app.screen = Screen::Case(Box::new(view(vec![0, 1, 2], vec![0, 1, 2])));
+    if let Screen::Case(v) = &mut app.screen {
+        v.tab = 1;
+    }
+    app.handle_key(&press(KeyCode::Tab));
+    let Screen::Case(v) = &app.screen else { unreachable!() };
+    assert_eq!(v.tab, 1, "tab must not move the strip");
+
+    app.handle_key(&press(KeyCode::BackTab));
+    let Screen::Case(v) = &app.screen else { unreachable!() };
+    assert_eq!(v.tab, 1, "backtab must not either");
+
+    app.handle_key(&press(KeyCode::Right));
+    let Screen::Case(v) = &app.screen else { unreachable!() };
+    assert_eq!(v.tab, 2, "←/→ still does");
+}
+
 /// The strip draws the whole journey, so it must say which parts of it are
 /// reachable — a dim label is a promise, a bright one is a control.
 #[test]

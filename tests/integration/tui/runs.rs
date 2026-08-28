@@ -1,6 +1,6 @@
 use guvnor::state;
 use guvnor::tui::runs::{HomeFocus, RunRow};
-use guvnor::tui::{gates_line, press, screen_text, App, Go, ART_WHITE};
+use guvnor::tui::{gates_line, press, screen_text, App, Go, ART_WHITE, JobKind, SELECTED_TEXT};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::Color;
@@ -135,11 +135,166 @@ fn selecting_a_row_keeps_badge_colours_and_bars_the_rest() {
             .find(|c| c.style().bg == Some(want))
     };
     // the cyan reviewed chip is on the selected row: it keeps its cyan
-    // background but its letters go light grey to read as selected.
+    // background but its letters go the darker selected-text grey to read
+    // as selected.
     let cyan = cell(Color::Cyan).expect("the reviewed chip keeps its cyan background");
-    assert_eq!(cyan.style().fg, Some(Color::Gray), "selected chip gets grey letters");
+    assert_eq!(cyan.style().fg, Some(SELECTED_TEXT), "selected chip gets the darker grey letters");
     assert!(cell(Color::Green).is_some(), "other badges keep their colour too");
     assert!(cell(ART_WHITE).is_some(), "the selected row wears the plain bar");
+}
+
+/// The gates column on a selected row must render as one grey: approved
+/// (green-backed) chips, unapproved `·` chips, and the `│` dividers between
+/// them all take the same darker-than-the-bar text colour — only the
+/// approved chip's green fill survives.
+#[test]
+fn selected_row_gates_take_selected_text_and_keep_chip_backgrounds() {
+    use guvnor::state::{Approval, Gates};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    let gates = Gates {
+        spec: Approval { approved: true, ..Default::default() },
+        tests: Approval::default(),
+        work: Approval::default(),
+    };
+    let mut app = App::for_test();
+    app.runs = vec![RunRow {
+        id: "id-1".into(),
+        title: "a feature".into(),
+        // cyan, not green, so the approved gate chip's green background
+        // can't be confused with the status badge's own fill.
+        status: state::Status::Reviewed,
+        verdict: "APPROVED".into(),
+        cost: "$1.00".into(),
+        gates: gates_line(&gates),
+    }];
+    app.table.select(Some(0));
+    let mut t = Terminal::new(TestBackend::new(120, 20)).unwrap();
+    t.draw(|f| app.render_runs(f, Rect::new(0, 0, 120, 20))).unwrap();
+    let buf = t.backend().buffer().clone();
+    let cells = || (0..20).flat_map(|y| (0..120).map(move |x| (x, y))).map(|(x, y)| buf[(x, y)].clone());
+
+    let approved_chip = cells()
+        .find(|c| c.style().bg == Some(Color::Green))
+        .expect("the approved gate chip keeps its green background");
+    assert_eq!(
+        approved_chip.style().fg,
+        Some(SELECTED_TEXT),
+        "approved chip letters go the darker selected-text grey"
+    );
+
+    let unapproved = cells().find(|c| c.symbol() == "·").expect("an unapproved chip dot is drawn");
+    assert_eq!(
+        unapproved.style().fg,
+        Some(SELECTED_TEXT),
+        "unapproved chip dots go the darker selected-text grey too"
+    );
+
+    let divider = cells().find(|c| c.symbol() == "│" && c.style().fg == Some(SELECTED_TEXT));
+    assert!(divider.is_some(), "the gate dividers also take the darker selected-text grey");
+}
+
+/// Off the bar, nothing about the status badge or the gates line changes:
+/// approved chips stay black-on-colour, unapproved chips and dividers stay
+/// plain dark grey.
+#[test]
+fn unselected_row_status_and_gates_keep_their_original_colours() {
+    use guvnor::state::{Approval, Gates};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    let gates = Gates {
+        spec: Approval { approved: true, ..Default::default() },
+        tests: Approval::default(),
+        work: Approval::default(),
+    };
+    let mut app = App::for_test();
+    app.runs = vec![RunRow {
+        id: "id-1".into(),
+        title: "a feature".into(),
+        status: state::Status::Committed,
+        verdict: "APPROVED".into(),
+        cost: "$1.00".into(),
+        gates: gates_line(&gates),
+    }];
+    app.table.select(None); // nothing selected — the row is plain
+    let mut t = Terminal::new(TestBackend::new(120, 20)).unwrap();
+    t.draw(|f| app.render_runs(f, Rect::new(0, 0, 120, 20))).unwrap();
+    let buf = t.backend().buffer().clone();
+    let cells = || (0..20).flat_map(|y| (0..120).map(move |x| (x, y))).map(|(x, y)| buf[(x, y)].clone());
+
+    let greens: Vec<_> = cells().filter(|c| c.style().bg == Some(Color::Green)).collect();
+    assert!(!greens.is_empty(), "the committed badge and the approved chip both render green");
+    assert!(
+        greens.iter().all(|c| c.style().fg == Some(Color::Black)),
+        "their letters stay black off the bar"
+    );
+
+    let unapproved = cells().find(|c| c.symbol() == "·").expect("an unapproved chip dot is drawn");
+    assert_eq!(unapproved.style().fg, Some(Color::DarkGray), "unapproved chips stay dark grey off the bar");
+
+    let divider = cells().find(|c| c.symbol() == "│" && c.style().fg == Some(Color::DarkGray));
+    assert!(divider.is_some(), "dividers stay dark grey off the bar");
+}
+
+/// A run's spinner status is the one status span with no background of its
+/// own — it must still pick up the darker selected-text grey when its row is
+/// selected, and stay plain cyan when it isn't.
+#[test]
+fn a_running_rows_spinner_takes_selected_text_when_selected_and_cyan_otherwise() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let make_app = |selected: bool| {
+        let mut app = App::for_test();
+        app.runs = vec![RunRow {
+            id: "id-1".into(),
+            title: "a feature".into(),
+            status: state::Status::Planned,
+            verdict: String::new(),
+            cost: String::new(),
+            gates: gates_line(&guvnor::state::Gates::default()),
+        }];
+        app.table.select(if selected { Some(0) } else { None });
+        app.start_job(JobKind::Run, Some("id-1".into()), |_tx| Ok(0));
+        app
+    };
+    let running_style = |app: &mut App| {
+        let mut t = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        t.draw(|f| app.render_runs(f, Rect::new(0, 0, 120, 20))).unwrap();
+        let screen = screen_text(t.backend().buffer());
+        let (y, line) = screen
+            .lines()
+            .enumerate()
+            .find(|(_, l)| l.contains("running"))
+            .expect("the running row is drawn");
+        let x = line.find("running").unwrap();
+        t.backend().buffer()[(x as u16, y as u16)].style()
+    };
+
+    let mut selected = make_app(true);
+    assert_eq!(
+        running_style(&mut selected).fg,
+        Some(SELECTED_TEXT),
+        "the selected running row's spinner text goes the darker selected-text grey too"
+    );
+
+    let mut unselected = make_app(false);
+    assert_eq!(running_style(&mut unselected).fg, Some(Color::Cyan), "off the bar it stays cyan");
+}
+
+/// The theme constant itself: an exact, achromatic grey strictly darker than
+/// the selection bar's own fill, tuned to stay legible against it.
+#[test]
+fn selected_text_is_a_darker_achromatic_tone_of_the_bar() {
+    match SELECTED_TEXT {
+        Color::Rgb(r, g, b) => {
+            assert_eq!(r, g, "SELECTED_TEXT must be achromatic (r == g)");
+            assert_eq!(g, b, "SELECTED_TEXT must be achromatic (g == b)");
+            assert!(r < 0xea, "SELECTED_TEXT must be strictly darker than ART_WHITE (0xea)");
+            assert!((0x70..=0xb0).contains(&r), "SELECTED_TEXT must stay in the legible 0x70-0xb0 range");
+        }
+        other => panic!("SELECTED_TEXT must be an exact Color::Rgb value, got {other:?}"),
+    }
 }
 
 /// `d` bins any run you haven't landed — planned, failed, staged alike.
