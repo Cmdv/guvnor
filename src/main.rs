@@ -12,7 +12,7 @@ struct Cli {
     /// No subcommand = the TUI; verbs below for scripting
     #[command(subcommand)]
     cmd: Option<Cmd>,
-    /// Show live lane output (TUI starts in verbose; CLI prints lane lines)
+    /// Print live lane output on the CLI (the TUI always shows it)
     #[arg(long, global = true)]
     verbose: bool,
 }
@@ -97,7 +97,9 @@ fn main() {
 fn run(cli: Cli) -> Result<i32> {
     let verbose = cli.verbose;
     let Some(cmd) = cli.cmd else {
-        return tui::run(verbose);
+        // The live lane feed is the TUI's whole point; --verbose only gates
+        // the CLI's stdout below.
+        return tui::run(true);
     };
     // Holding a gate and landing a diff are the human's. `lane::run` sets
     // GUVNOR_LANE on the CLI it spawns and the whole tree inherits it, so a lane
