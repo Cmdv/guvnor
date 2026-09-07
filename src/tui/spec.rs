@@ -31,24 +31,31 @@ impl Default for Prompt {
     }
 }
 
-/// Cursor and scroll offsets for the spec's six boxes. Every box is always on
-/// screen; the one with the cursor is the one the arrows scroll, and its number
-/// gets you there directly — that is how content taller than its box is read,
-/// rather than by making the box taller than the screen.
+/// Cursor, scroll offsets, and zoom for the spec's six boxes. Every box is on
+/// screen by default; the one with the cursor is the one the arrows scroll.
+/// Its number jumps the cursor there *and* zooms it to fill the tab, tmux
+/// style — content taller than its box was already read by scrolling, zoom
+/// just gives it the whole screen to do that in. Esc unzooms; the grid is the
+/// resting state.
 #[derive(Default)]
 pub struct SpecPanels {
     pub focus: usize,
+    pub zoomed: bool,
     pub scrolls: [Scroll; 6],
 }
 
 impl SpecPanels {
-    /// `1`-`6` jump, tab/backtab walk to the next/previous box, arrows scroll
-    /// the box they land on. Returns whether the key was ours, so the caller
-    /// can pass on the ones that aren't.
+    /// `1`-`6` jump and zoom, tab/backtab walk to the next/previous box
+    /// (zoomed or not — whichever box has the cursor is the one shown),
+    /// arrows scroll the box they land on. Returns whether the key was ours,
+    /// so the caller can pass on the ones that aren't. Esc (unzoom) is the
+    /// caller's job: it also means "leave the screen" when not zoomed, and
+    /// that choice is the run screen's, not this box's.
     pub fn handle(&mut self, key: &KeyEvent) -> bool {
         match key.code {
             KeyCode::Char(c @ '1'..='6') => {
                 self.focus = c as usize - '1' as usize;
+                self.zoomed = true;
                 true
             }
             KeyCode::Tab => {
@@ -96,11 +103,49 @@ pub fn panel_rows(width: u16) -> Vec<Vec<usize>> {
     }
 }
 
-/// The spec as boxes. Every box is drawn, always: heights are shared out in
-/// proportion to what each section needs, so nothing is hidden and no space is
-/// wasted, and anything that still doesn't fit is scrolled inside its own box.
+/// One spec box: chrome, number, wrap, scroll — shared by the grid cell and
+/// the zoomed full-tab view, which differ only in the `Rect` they get and
+/// whether there's a bottom hint (the grid's numbers are already the hint).
+fn render_panel(f: &mut Frame, cell: Rect, i: usize, s: &[SpecSection], p: &SpecPanels, bottom: Option<Line<'static>>) {
+    let focused = i == p.focus;
+    let (border, text) = if focused {
+        (Color::White, Style::new().fg(Color::White).bold())
+    } else {
+        (MODAL_BORDER, Style::new().fg(Color::Cyan).bold())
+    };
+    // The number is the key that gets you here, so it is red like every
+    // other "press this" in the app; the brackets track the border, so a
+    // focused panel lights them white too.
+    let chrome = Style::new().fg(border);
+    let title = Line::from(vec![
+        Span::styled("─┐ ", chrome),
+        Span::styled(format!("{}", i + 1), Style::new().fg(Color::Red).bold()),
+        Span::styled(format!(" {} ", s[i].title), text),
+        Span::styled(if focused { "↑↓ ┌" } else { "┌" }, chrome),
+    ]);
+    let mut block = boxed("", Style::new())
+        .title(title)
+        .border_style(Style::new().fg(border))
+        .padding(Padding::horizontal(1));
+    if let Some(hint) = bottom {
+        block = block.title_bottom(hint);
+    }
+    let inner = block.inner(cell);
+    let wrapped = hang_wrap_all(&s[i].body, inner.width.max(1) as usize);
+    let off = p.scrolls[i].fit(wrapped.len(), inner.height);
+    f.render_widget(Paragraph::new(wrapped).scroll((off, 0)).block(block), cell);
+}
+
+/// The spec as boxes. Zoomed, the focused one fills `area` alone. Otherwise
+/// every box is drawn, always: heights are shared out in proportion to what
+/// each section needs, so nothing is hidden and no space is wasted, and
+/// anything that still doesn't fit is scrolled inside its own box.
 pub fn render_spec_panels(f: &mut Frame, area: Rect, sp: &Spec, p: &SpecPanels) {
     let s = spec_sections(sp);
+    if p.zoomed {
+        render_panel(f, area, p.focus, &s, p, Some(hint_line(&[("esc", "unzoom")])));
+        return;
+    }
     let rows = panel_rows(area.width);
     // Height each row would like: the tallest of its boxes, wrapped at the width
     // it will actually get. 2 border rows + 2 padding columns per box.
@@ -132,30 +177,7 @@ pub fn render_spec_panels(f: &mut Frame, area: Rect, sp: &Spec, p: &SpecPanels) 
         let cols = Layout::horizontal(vec![Constraint::Ratio(1, row.len() as u32); row.len()])
             .split(*row_area);
         for (&i, cell) in row.iter().zip(cols.iter()) {
-            let focused = i == p.focus;
-            let (border, text) = if focused {
-                (Color::White, Style::new().fg(Color::White).bold())
-            } else {
-                (MODAL_BORDER, Style::new().fg(Color::Cyan).bold())
-            };
-            // The number is the key that gets you here, so it is red like every
-            // other "press this" in the app; the brackets track the border, so a
-            // focused panel lights them white too.
-            let chrome = Style::new().fg(border);
-            let title = Line::from(vec![
-                Span::styled("─┐ ", chrome),
-                Span::styled(format!("{}", i + 1), Style::new().fg(Color::Red).bold()),
-                Span::styled(format!(" {} ", s[i].title), text),
-                Span::styled(if focused { "↑↓ ┌" } else { "┌" }, chrome),
-            ]);
-            let block = boxed("", Style::new())
-                .title(title)
-                .border_style(Style::new().fg(border))
-                .padding(Padding::horizontal(1));
-            let inner = block.inner(*cell);
-            let wrapped = hang_wrap_all(&s[i].body, inner.width.max(1) as usize);
-            let off = p.scrolls[i].fit(wrapped.len(), inner.height);
-            f.render_widget(Paragraph::new(wrapped).scroll((off, 0)).block(block), *cell);
+            render_panel(f, *cell, i, &s, p, None);
         }
     }
 }

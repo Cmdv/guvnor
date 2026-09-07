@@ -1,4 +1,5 @@
 use guvnor::digest;
+use guvnor::spec::Spec;
 use guvnor::state::{self, State, Status};
 use guvnor::tui::{
     click, line_text, next_step, press, screen_text, spec_drifted, spec_sha, status_badge,
@@ -57,6 +58,39 @@ fn view(live: Vec<usize>, shown: Vec<usize>) -> CaseView {
         confirm: None,
         staged: false,
     }
+}
+
+/// A digit on the Spec tab zooms that box to fill the tab (tmux style); esc
+/// backs out of the zoom without leaving the run screen — leaving is one esc
+/// further out, same as any other popup on this screen.
+#[test]
+fn a_spec_digit_zooms_and_esc_unzooms_before_it_leaves_the_screen() {
+    use ratatui::crossterm::event::KeyCode;
+    let mut v = view(vec![0], vec![0, 1, 2]);
+    v.spec = Some(Spec {
+        title: "t".into(),
+        objective: "o".into(),
+        files: vec![],
+        interfaces: vec![],
+        constraints: vec![],
+        verification: "true".into(),
+        acceptance_criteria: vec![],
+    });
+    let mut app = App::for_test();
+    app.screen = Screen::Case(Box::new(v));
+
+    assert!(app.handle_key(&press(KeyCode::Char('2'))).is_none());
+    let Screen::Case(v) = &app.screen else { unreachable!() };
+    assert!(v.panels.zoomed, "a digit zooms the box it focuses");
+    assert_eq!(v.panels.focus, 1);
+
+    // esc backs out of the zoom, not out of the run screen
+    assert!(app.handle_key(&press(KeyCode::Esc)).is_none(), "esc unzooms first");
+    let Screen::Case(v) = &app.screen else { unreachable!() };
+    assert!(!v.panels.zoomed);
+
+    // now esc means what it always means on this screen: leave for Runs
+    assert!(matches!(app.handle_key(&press(KeyCode::Esc)), Some(Go::Runs)));
 }
 
 /// `r` on a run that already has patches is a re-run: it bins them and pays

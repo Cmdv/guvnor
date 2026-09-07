@@ -97,6 +97,26 @@ fn a_number_picks_a_box_and_the_arrows_scroll_that_one() {
     }
 }
 
+/// Zoom is the point of the number, tmux style: pressing it doesn't just move
+/// the cursor, it makes that box the only one on the tab. The others — their
+/// numbers included — are gone, not just unfocused, until esc puts the grid
+/// back (esc itself is the run screen's to handle, not this box's).
+#[test]
+fn pressing_a_number_zooms_the_box_to_the_whole_tab() {
+    let mut p = SpecPanels::default();
+    assert!(p.handle(&press(KeyCode::Char('2'))));
+    assert!(p.zoomed);
+    let text = screen(120, 30, &p);
+    assert!(text.contains("2 Files"), "{text}");
+    assert!(!text.contains("1 Objective"), "the rest must be gone, not just unfocused:\n{text}");
+    assert!(!text.contains("6 Acceptance"), "{text}");
+    assert!(text.contains("unzoom"), "the way back belongs on screen: {text}");
+
+    p.zoomed = false;
+    let text = screen(120, 30, &p);
+    assert!(text.contains("1 Objective") && text.contains("2 Files"), "unzoomed is the grid again:\n{text}");
+}
+
 /// Tab/backtab are the digits' next/prev: the same six boxes, walked in
 /// order instead of jumped to, wrapping at both ends so it is a cycle rather
 /// than a dead stop.
