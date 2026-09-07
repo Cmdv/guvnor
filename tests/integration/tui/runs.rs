@@ -41,6 +41,31 @@ fn enter_plans_it_and_shift_enter_types_a_newline() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A paste lands in the focused field as one string, not replayed key by
+/// key — the title takes it whole (up to `max`), the context keeps a `\n`
+/// as a real line break.
+#[test]
+fn paste_lands_in_the_focused_field_of_the_new_panel() {
+    let mut app = App::for_test();
+    app.focus = HomeFocus::New; // new.focus == 0: the title field
+    app.handle_paste("add stats for the dashboard");
+    assert_eq!(app.new.title.value, "add stats for the dashboard");
+    app.new.focus = 1; // the context field
+    app.handle_paste("first line\nsecond line");
+    assert_eq!(app.new.context.value(), "first line\nsecond line");
+}
+
+/// Nothing focused: a paste must be dropped, never replayed as keystrokes —
+/// otherwise a `q` or `d` inside pasted text could quit the app or open the
+/// delete-confirm popup instead of landing as text somewhere.
+#[test]
+fn paste_with_nothing_focused_is_dropped_not_replayed_as_keys() {
+    let mut app = App::for_test();
+    app.handle_paste("d q anything");
+    assert!(app.confirm_delete.is_none(), "must not have acted like pressing 'd'");
+    assert_eq!(app.new.title.value, "", "and nothing was typed into the panel either");
+}
+
 /// The new-feature panel is a permanent box on the home screen — no key
 /// press, no separate screen. Its two inner fields are always drawn.
 #[test]

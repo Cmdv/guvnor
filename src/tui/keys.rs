@@ -379,6 +379,12 @@ impl App {
                 }
                 let Screen::Case(v) = &mut self.screen else { return None };
                 match key.code {
+                    // A zoomed spec panel eats its own esc — leaving the run
+                    // screen is one esc further out, same as any other popup.
+                    KeyCode::Esc if v.tab == 0 && v.panels.zoomed => {
+                        v.panels.zoomed = false;
+                        None
+                    }
                     KeyCode::Esc => Some(Go::Runs),
                     // The tab strip is ←/→ (h/l) only — tab is for focus, never
                     // for the strip, or it would mean two different things
@@ -454,6 +460,65 @@ impl App {
                 }
             }
             Screen::Landed { .. } => Some(Go::Runs),
+        }
+    }
+
+    /// A terminal paste (crossterm's `Event::Paste`, produced only once
+    /// `EnableBracketedPaste` is on — see `enter()`). Mirrors `handle_key`'s
+    /// screen-by-screen precedence and lands in whatever text field a
+    /// keystroke would reach right now — never further: no field focused
+    /// means the paste is silently dropped, not replayed as keystrokes that
+    /// could fire an app action (`q`, `d`, …) instead of typing text.
+    pub fn handle_paste(&mut self, text: &str) {
+        match &mut self.screen {
+            Screen::Runs => {
+                if let Some(cv) = self.config.as_mut() {
+                    // The version dropdown swallows keys first; everywhere
+                    // else, only a text row (`text_input`) takes them.
+                    if cv.drop.is_none() {
+                        if let Some(input) = cv.text_input(cv.row) {
+                            input.paste_str(text);
+                        }
+                    }
+                } else if self.confirm_delete.is_some() {
+                    // buttons only
+                } else if self.filtering {
+                    self.filter.paste_str(text);
+                    self.clamp_selection();
+                } else if self.focus == HomeFocus::New {
+                    if self.new.focus == 0 {
+                        self.new.title.paste_str(text);
+                    } else {
+                        self.new.context.paste_str(text);
+                    }
+                }
+            }
+            Screen::Progress => {}
+            Screen::Case(_) => {
+                if let Some(v) = self.commit.as_mut().filter(|v| v.open) {
+                    if !v.drafting && v.focus == CommitFocus::Message {
+                        v.msg.paste_str(text);
+                    }
+                    return;
+                }
+                let Screen::Case(v) = &mut self.screen else { unreachable!() };
+                if let Some(p) = v.feedback.as_mut() {
+                    if !p.on_buttons {
+                        p.text.paste_str(text);
+                    }
+                } else if let Some(note) = v.note.as_mut() {
+                    note.paste_str(text);
+                } else if v.confirm.is_some() {
+                    // buttons only
+                } else if v.tab == REVIEW_TAB {
+                    if let Some(r) = v.review.as_deref_mut() {
+                        if r.focus == ReviewFocus::Findings && r.sel == r.note_row() {
+                            r.note.paste_str(text);
+                        }
+                    }
+                }
+            }
+            Screen::Landed { .. } => {}
         }
     }
 

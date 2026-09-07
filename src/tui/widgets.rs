@@ -88,19 +88,35 @@ impl LineInput {
             .unwrap_or(self.value.len())
     }
 
+    /// Insert one character at the cursor, respecting `max`. `handle`'s
+    /// `Char` arm and `paste_str` both go through this, so a pasted string
+    /// truncates exactly where typing it out by hand would stop.
+    pub fn insert_char(&mut self, c: char) {
+        if self.max > 0 && self.value.chars().count() >= self.max {
+            return;
+        }
+        let i = self.byte_index();
+        self.value.insert(i, c);
+        self.cursor += 1;
+    }
+
+    /// A terminal paste, dropped in at the cursor. Single-line by contract,
+    /// so a `\n`/`\r` in the pasted text is dropped rather than inserted —
+    /// the same as a bare Enter, which `handle` below has no case for.
+    pub fn paste_str(&mut self, s: &str) {
+        for c in s.chars() {
+            if c != '\n' && c != '\r' {
+                self.insert_char(c);
+            }
+        }
+    }
+
     pub fn handle(&mut self, key: &KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             // Ctrl+letter arrives as Char('u') + CONTROL, so without the guard
             // the reflex for "kill this line" types a `u` into the field.
-            KeyCode::Char(c) if !ctrl => {
-                if self.max > 0 && self.value.chars().count() >= self.max {
-                    return;
-                }
-                let i = self.byte_index();
-                self.value.insert(i, c);
-                self.cursor += 1;
-            }
+            KeyCode::Char(c) if !ctrl => self.insert_char(c),
             KeyCode::Backspace if self.cursor > 0 => {
                 self.cursor -= 1;
                 let i = self.byte_index();
@@ -426,6 +442,40 @@ impl TextArea {
         true
     }
 
+    /// Insert one character at the cursor, replacing the selection first if
+    /// there is one. `handle`'s `Char` arm and `paste_str` both go through
+    /// this.
+    fn insert_char(&mut self, c: char) {
+        self.delete_selection();
+        let i = Self::byte_index(&self.lines[self.row], self.col);
+        self.lines[self.row].insert(i, c);
+        self.col += 1;
+    }
+
+    /// Split the line at the cursor — what ⇧↵ does, and what a `\n` in a
+    /// paste does too.
+    fn insert_newline(&mut self) {
+        self.delete_selection();
+        let i = Self::byte_index(&self.lines[self.row], self.col);
+        let rest = self.lines[self.row].split_off(i);
+        self.lines.insert(self.row + 1, rest);
+        self.row += 1;
+        self.col = 0;
+    }
+
+    /// A terminal paste, dropped in at the cursor a character at a time, so a
+    /// selection is replaced and a `\n` starts a new line exactly like typing
+    /// it out by hand would.
+    pub fn paste_str(&mut self, s: &str) {
+        for c in s.chars() {
+            match c {
+                '\r' => {}
+                '\n' => self.insert_newline(),
+                c => self.insert_char(c),
+            }
+        }
+    }
+
     /// ⇧↵ splits the line. Bare ↵ is left to the caller — in every box this
     /// lives in, it means "done", and a newline you have to ask for is cheaper
     /// than a submit you didn't.
@@ -444,20 +494,8 @@ impl TextArea {
         let w = self.w.get();
         match key.code {
             // Same as LineInput: a Ctrl+letter shortcut must not become text.
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.delete_selection();
-                let i = Self::byte_index(&self.lines[self.row], self.col);
-                self.lines[self.row].insert(i, c);
-                self.col += 1;
-            }
-            KeyCode::Enter if key.modifiers.intersects(newline_mods()) => {
-                self.delete_selection();
-                let i = Self::byte_index(&self.lines[self.row], self.col);
-                let rest = self.lines[self.row].split_off(i);
-                self.lines.insert(self.row + 1, rest);
-                self.row += 1;
-                self.col = 0;
-            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => self.insert_char(c),
+            KeyCode::Enter if key.modifiers.intersects(newline_mods()) => self.insert_newline(),
             KeyCode::Backspace => {
                 if self.delete_selection() {
                     return;
