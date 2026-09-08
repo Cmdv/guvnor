@@ -7,9 +7,10 @@
 # guvnor
 
 Spec-gated feature orchestrator: LLM lanes type, evidence decides, humans hold
-the gates. Design lessons come from
-[`CharlesHoskinson/foreman`](https://github.com/CharlesHoskinson/foreman)'s
-public incident log of a similar loop lying to itself.
+the gates. Same architecture and pipeline as
+[`CharlesHoskinson/foreman`](https://github.com/CharlesHoskinson/foreman) — even
+the name is the joke, guvnor is British slang for foreman. The one real
+difference: a human approves every gate before the loop moves on.
 
 ## Install
 
