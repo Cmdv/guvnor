@@ -17,6 +17,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
+use std::cell::Cell;
 
 use crate::state::Status;
 
@@ -148,6 +149,8 @@ pub struct CommitView {
     /// A draft is being written. The modal stays up: you asked for a message,
     /// not for a trip to the progress screen.
     pub drafting: bool,
+    /// The message box's last-drawn rect, so a click can focus it.
+    msg_cell: Cell<Rect>,
 }
 
 impl CommitView {
@@ -163,12 +166,13 @@ impl CommitView {
             // `commit`, because a stray ↵ must never write git history or fire
             // the paid `generate` lane — landing a commit is the one move you
             // step over to on purpose.
-            buttons: Buttons {
-                labels: &["generate", "copy", "commit"],
-                sel: 1,
-                colors: &[Color::Gray, Color::Green, Color::Gray],
+            buttons: {
+                let mut b = Buttons::new(&["generate", "copy", "commit"], &[Color::Gray, Color::Green, Color::Gray]);
+                b.sel = 1;
+                b
             },
             drafting: false,
+            msg_cell: Cell::new(Rect::default()),
         }
     }
 
@@ -186,6 +190,17 @@ impl CommitView {
         self.msg = TextArea::from(text);
         self.drafting = false;
         self.focus = CommitFocus::Message;
+    }
+
+    /// Whether a click at `pos` hit the message box.
+    pub fn msg_hit(&self, pos: Position) -> bool {
+        self.msg_cell.get().contains(pos)
+    }
+
+    /// Where the message box last drew, so a test can click it without
+    /// knowing the layout math.
+    pub fn msg_rect(&self) -> Rect {
+        self.msg_cell.get()
     }
 }
 
@@ -355,6 +370,7 @@ impl App {
             v.focus == CommitFocus::Message,
         );
         let minner = mbox.inner(msg_a);
+        v.msg_cell.set(minner);
         f.render_widget(mbox, msg_a);
         if v.drafting {
             f.render_widget(

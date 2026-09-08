@@ -1,6 +1,6 @@
 [package]
 name = "guvnor"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Spec-gated feature orchestrator: humans hold the gates, LLM lanes do the typing, evidence decides."
 license = "Apache-2.0"

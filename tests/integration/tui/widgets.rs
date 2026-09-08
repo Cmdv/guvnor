@@ -116,6 +116,20 @@ fn line_input_ctrl_arrows_jump_by_word() {
     assert_eq!(i.cursor, 7);
 }
 
+/// A paste goes in through the same `insert_char` a keystroke uses, so it
+/// truncates at `max` exactly like typing it out by hand would — and drops a
+/// `\n`/`\r` rather than inserting one, since a single-line field has
+/// nowhere to put it (same as the bare Enter `handle` already ignores).
+#[test]
+fn line_input_paste_respects_max_and_drops_newlines() {
+    let mut i = LineInput { max: 5, ..Default::default() };
+    i.paste_str("hello world");
+    assert_eq!(i.value, "hello", "truncated at max, same as typing would be");
+    let mut i2 = LineInput::default();
+    i2.paste_str("a\r\nb\nc");
+    assert_eq!(i2.value, "abc", "newlines dropped, not inserted");
+}
+
 #[test]
 fn textarea_newline_and_join() {
     use ratatui::crossterm::event::KeyModifiers;
@@ -213,6 +227,34 @@ fn shift_arrows_select_and_typing_replaces_it() {
     assert_eq!(t3.value(), "hllo", "backspace removed one char, not the old selection");
 }
 
+/// A paste's `\n` starts a new line, same as ⇧↵ — including a blank line
+/// between paragraphs, which is just two newlines in a row. `\r\n` acts the
+/// same: the lone `\r` is dropped and the `\n` right after it still starts
+/// the line.
+#[test]
+fn textarea_paste_keeps_every_newline_including_blank_lines() {
+    let mut t = TextArea::default();
+    let pasted = "first paragraph\n\nsecond paragraph, line one\nsecond paragraph, line two";
+    t.paste_str(pasted);
+    assert_eq!(t.value(), pasted, "the blank line between paragraphs must survive");
+
+    let mut crlf = TextArea::default();
+    crlf.paste_str("one\r\ntwo\r\n\r\nthree");
+    assert_eq!(crlf.value(), "one\ntwo\n\nthree", "CRLF line endings normalise the same way");
+}
+
+/// A paste replaces a selection first, same as typing over one.
+#[test]
+fn textarea_paste_replaces_a_selection() {
+    let mut t = TextArea::from("hello world");
+    t.col = 0;
+    for _ in 0..2 {
+        t.handle(&KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT)); // selects "he"
+    }
+    t.paste_str("X");
+    assert_eq!(t.value(), "Xllo world");
+}
+
 #[test]
 fn scroll_stops_with_the_last_line_at_the_bottom() {
     let mut s = Scroll::default();
@@ -274,6 +316,19 @@ fn armed_button_is_filled_edge_to_edge_and_both_keep_their_outline() {
         (1..13).all(|x| buf2[(x, inner_y)].style().bg != Some(Color::Green)),
         "nothing is armed when the section is unfocused"
     );
+}
+
+/// A click hits exactly what render drew, same contract as the tab strip.
+#[test]
+fn a_click_hits_the_button_render_drew_there() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    let b = Buttons::new(&["continue", "skip"], YES_NO);
+    let mut t = Terminal::new(TestBackend::new(40, 3)).unwrap();
+    t.draw(|f| b.render(f, Rect::new(0, 0, 40, 3), true)).unwrap();
+    assert_eq!(b.hit(Position::new(2, 1)), Some(0), "inside continue");
+    assert_eq!(b.hit(Position::new(18, 1)), Some(1), "inside skip");
+    assert_eq!(b.hit(Position::new(35, 1)), None, "past the last button");
 }
 
 #[test]

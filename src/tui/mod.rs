@@ -77,17 +77,21 @@ fn hand_back_on_panic() {
     }));
 }
 
-/// Take the terminal, and ask for the kitty keyboard protocol while we have it:
-/// without it ⇧↵ arrives as a plain ↵, and in a box where ↵ submits there is
-/// then no way to type a newline at all. Best effort — a terminal that doesn't
-/// understand the escape ignores it, and alt+↵ still works there.
+/// Take the terminal, and ask for the kitty keyboard protocol and bracketed
+/// paste while we have it: without the former ⇧↵ arrives as a plain ↵, and in
+/// a box where ↵ submits there is then no way to type a newline at all;
+/// without the latter, a paste never arrives as its own event (`handle_paste`
+/// never runs), and a terminal with its own paste protection (Ghostty,
+/// iTerm2, …) has no way to know a paste here is safe, so it blocks the paste
+/// instead of sending it. Both best effort — a terminal that doesn't
+/// understand an escape ignores it.
 ///
 /// Spelled out rather than `ratatui::init`, whose panic hook fires on every
 /// thread and does not know about the keyboard flags. `hand_back_on_panic` owns
 /// that job.
 fn enter() -> DefaultTerminal {
     use ratatui::crossterm::event::{
-        EnableMouseCapture, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        EnableBracketedPaste, EnableMouseCapture, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     };
     use ratatui::crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
     enable_raw_mode().expect("enable raw mode");
@@ -95,6 +99,7 @@ fn enter() -> DefaultTerminal {
         std::io::stdout(),
         EnterAlternateScreen,
         EnableMouseCapture,
+        EnableBracketedPaste,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     );
     ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
@@ -108,6 +113,7 @@ fn leave() {
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
         ratatui::crossterm::event::DisableMouseCapture,
+        ratatui::crossterm::event::DisableBracketedPaste,
         ratatui::crossterm::event::PopKeyboardEnhancementFlags
     );
     ratatui::restore();
@@ -208,6 +214,14 @@ pub struct App {
     pub cfg_models: Option<[String; 3]>, // planner/worker/reviewer for the config box
     pub runs: Vec<RunRow>,
     pub table: TableState,
+    /// Each visible run row's last-drawn rect, keyed by its position in
+    /// `visible_idx()` — what `table.select` takes — for a click to hit.
+    pub row_cells: Cells<usize>,
+    /// The runs box and the config box, whole: a click anywhere in the
+    /// former (that isn't a row) just focuses it; anywhere in the latter
+    /// opens the config modal, same as `c`.
+    pub runs_box: Rect,
+    pub cfg_box: Rect,
     pub screen: Screen,
     pub job: Option<Job>,
     pub toast: Option<(String, Instant)>,
@@ -236,6 +250,9 @@ impl App {
             cfg_models: None,
             runs: Vec::new(),
             table: TableState::default(),
+            row_cells: Cells::default(),
+            runs_box: Rect::default(),
+            cfg_box: Rect::default(),
             screen: Screen::Runs,
             job: None,
             toast: None,
@@ -363,6 +380,9 @@ impl App {
             cfg_models: None,
             runs: Vec::new(),
             table: TableState::default(),
+            row_cells: Cells::default(),
+            runs_box: Rect::default(),
+            cfg_box: Rect::default(),
             screen: Screen::Runs,
             job: None,
             toast: None,
@@ -414,8 +434,7 @@ impl App {
                         None => {}
                     }
                 }
-                // Only the Case screen's tab strip answers today. Every
-                // other screen is a deliberate `None` in `handle_mouse`.
+                Event::Paste(text) => self.handle_paste(&text),
                 Event::Mouse(m) => {
                     if let Some(go) = self.handle_mouse(&m) {
                         self.apply(go);

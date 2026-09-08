@@ -149,12 +149,19 @@ impl App {
             log_area,
         );
         if let (Some(area), Some(j)) = (lane_area, &self.job) {
-            let h = area.height.saturating_sub(2) as usize;
-            let start = j.tail.len().saturating_sub(h);
-            let tail: Vec<Line> = j
+            let block = boxed(
+                &format!(
+                    "lane: {} · tools: {} · denials: {}",
+                    if j.lane.is_empty() { "—" } else { &j.lane },
+                    j.tools,
+                    j.denials
+                ),
+                Style::new(),
+            );
+            let inner = block.inner(area);
+            let styled: Vec<Line> = j
                 .tail
                 .iter()
-                .skip(start)
                 .map(|l| {
                     if l.starts_with("── ") {
                         Line::styled(l.clone(), Style::new().fg(Color::Cyan).bold())
@@ -168,23 +175,25 @@ impl App {
                         ])
                     } else if l.starts_with('✗') {
                         Line::styled(l.clone(), Style::new().fg(Color::Red))
-                    } else {
+                    } else if l.trim().is_empty() {
                         Line::raw(l.clone())
+                    } else {
+                        // the model's own words, not a tool call — a dim
+                        // bullet lines it up with the `→ ` rows around it
+                        Line::from(vec![
+                            Span::styled("‣ ", Style::new().fg(Color::DarkGray)),
+                            Span::raw(l.clone()),
+                        ])
                     }
                 })
                 .collect();
-            f.render_widget(
-                Paragraph::new(tail).block(boxed(
-                    &format!(
-                        "lane: {} · tools: {} · denials: {}",
-                        if j.lane.is_empty() { "—" } else { &j.lane },
-                        j.tools,
-                        j.denials
-                    ),
-                    Style::new(),
-                )),
-                area,
-            );
+            // Wrap before windowing on height: a line wider than the box used
+            // to be cut off silently at the border instead of read, same as
+            // every other body of text in the app.
+            let wrapped = hang_wrap_all(&styled, inner.width.max(1) as usize);
+            let start = wrapped.len().saturating_sub(inner.height as usize);
+            let tail: Vec<Line> = wrapped.into_iter().skip(start).collect();
+            f.render_widget(Paragraph::new(tail).block(block), area);
         }
     }
 

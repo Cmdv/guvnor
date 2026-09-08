@@ -65,13 +65,14 @@ fn review_tab_takes_its_own_keys_but_never_traps_the_tab_strip() {
     assert_eq!(r.note.value, "keep me", "scrolling must not reach the text field");
 }
 
-/// Reported: on a review with no findings the cursor starts on the
-/// instruction line, and ←/→ disappeared into an empty text field — so the
-/// tab strip was unreachable and the tab could not be left.
+/// Reported: on a review with no findings the cursor used to start on the
+/// instruction line (coincidentally `note_row() == 0` too), handing the
+/// keyboard to a text field uninvited. It now starts on the actions instead,
+/// and ←/→ must still reach the tab strip from there.
 #[test]
 fn an_empty_review_is_not_a_tab_you_get_stuck_in() {
     let mut r = review_stub(0);
-    assert_eq!(r.sel, r.note_row(), "nothing to tick: the cursor starts on the field");
+    assert_eq!(r.sel, r.action_row(), "nothing to tick or type: land on the actions, not the field");
     for code in [KeyCode::Left, KeyCode::Right] {
         assert!(
             matches!(review_key(&mut r, &press(code)), Took::No),
@@ -160,36 +161,40 @@ fn a_pane_scrolls_until_its_last_line_rests_on_the_bottom_row() {
     assert_eq!(last.len(), first.len(), "same screenful, just scrolled");
 }
 
-/// A red letter in a box title means "press this to get there".
+/// A number in a box title jumps and zooms straight to it, Spec-tab style.
 #[test]
-fn a_red_letter_jumps_straight_to_its_section() {
+fn a_number_jumps_and_zooms_its_section() {
     let mut r = review_stub(2);
     for (key, want) in [
-        ('r', ReviewFocus::Summary),
-        ('t', ReviewFocus::Cost),
-        ('s', ReviewFocus::Stage),
-        ('f', ReviewFocus::Findings),
+        ('2', ReviewFocus::Summary),
+        ('3', ReviewFocus::Cost),
+        ('4', ReviewFocus::Stage),
+        ('1', ReviewFocus::Findings),
     ] {
+        r.zoomed = false;
         assert!(matches!(review_key(&mut r, &press(KeyCode::Char(key))), Took::Yes));
         assert!(r.focus == want, "{key} should have jumped");
+        assert!(r.zoomed, "{key} should have zoomed");
     }
     // ...and it works from anywhere, not just the findings
     r.focus = ReviewFocus::Cost;
-    review_key(&mut r, &press(KeyCode::Char('r')));
+    review_key(&mut r, &press(KeyCode::Char('2')));
     assert!(r.focus == ReviewFocus::Summary);
 
-    // but never while typing an instruction: the letters are text there
+    // but never while typing an instruction: the digits are text there
     r.focus = ReviewFocus::Findings;
+    r.zoomed = false;
     r.sel = r.note_row();
-    review_key(&mut r, &press(KeyCode::Char('t')));
-    assert_eq!(r.note.value, "t");
+    review_key(&mut r, &press(KeyCode::Char('3')));
+    assert_eq!(r.note.value, "3");
     assert!(r.focus == ReviewFocus::Findings);
-    // the buttons hold no letters, so the jumps keep working while the
+    assert!(!r.zoomed, "typing a digit must not zoom");
+    // the buttons hold no digits, so the jumps keep working while the
     // cursor is on them — `→ ↵` is how you pick the second one
     r.focus = ReviewFocus::Findings;
     r.sel = r.action_row();
     r.note.value = "drop it".into();
-    assert!(matches!(review_key(&mut r, &press(KeyCode::Char('r'))), Took::Yes));
+    assert!(matches!(review_key(&mut r, &press(KeyCode::Char('2'))), Took::Yes));
     assert!(r.focus == ReviewFocus::Summary);
 }
 
@@ -212,6 +217,34 @@ fn down_walks_the_buttons_and_comes_back_round_to_the_list() {
     r.sel = r.action_row();
     review_key(&mut r, &press(KeyCode::Up));
     assert_eq!(r.sel, r.note_row());
+}
+
+/// Zoom is the point of the number: it doesn't just move the cursor, it
+/// makes that pane the only one on the tab, tmux style.
+#[test]
+fn zooming_a_pane_hides_the_others() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    let mut v = review_stub(1);
+    v.zoomed = true;
+    v.focus = ReviewFocus::Cost;
+    v.cost = vec![guvnor::casefile::CostRow { name: "planner".into(), tin: 10, tout: 10, cost: 0.01 }];
+    v.cost_total = guvnor::casefile::cost_total(&v.cost);
+    let area = Rect::new(0, 0, 100, 30);
+    let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
+
+    t.draw(|f| render_review_tab(f, area, &v)).unwrap();
+    let text = screen_text(t.backend().buffer());
+    assert!(text.contains("3 tokens / cost"), "{text}");
+    assert!(!text.contains("1 findings"), "the rest must be gone, not just unfocused:\n{text}");
+    assert!(!text.contains("2 reviewer comment"), "{text}");
+    assert!(!text.contains("4 stage"), "{text}");
+    assert!(text.contains("unzoom"), "the way back belongs on screen: {text}");
+
+    v.zoomed = false;
+    t.draw(|f| render_review_tab(f, area, &v)).unwrap();
+    let text = screen_text(t.backend().buffer());
+    assert!(text.contains("1 findings") && text.contains("3 tokens / cost"), "unzoomed is the grid again:\n{text}");
 }
 
 #[test]

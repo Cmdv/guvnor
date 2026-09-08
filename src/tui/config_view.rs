@@ -61,6 +61,14 @@ pub struct ConfigView {
     /// Open model dropdown for the focused seat: (selection, options).
     pub drop: Option<(usize, Vec<String>)>,
     pub buttons: Buttons,
+    /// Each settings row's last-drawn rect, for a click to focus it.
+    pub row_cells: Cells<usize>,
+    /// The preset rows' ◀/▶ glyphs (row 0 language, row 4 model): narrower
+    /// than the row, so a click there wins and cycles instead of only
+    /// focusing. Keyed by (row, direction).
+    pub preset_cells: Cells<(usize, i32)>,
+    /// The open dropdown's option rows, for a click to pick one.
+    pub drop_cells: Cells<usize>,
 }
 
 /// Rows 0..10 are settings; the last row is the action row (save/cancel).
@@ -91,7 +99,41 @@ impl ConfigView {
             rework: LineInput::with(&limits.max_rework_rounds.to_string()),
             drop: None,
             buttons: Buttons::new(&["save", "cancel"], YES_NO),
+            row_cells: Cells::default(),
+            preset_cells: Cells::default(),
+            drop_cells: Cells::default(),
         }
+    }
+
+    /// The settings row a click at `pos` hits, if the last render drew one there.
+    pub fn row_hit(&self, pos: Position) -> Option<usize> {
+        self.row_cells.hit(pos)
+    }
+
+    /// Where row `i` last drew, so a test can click it without knowing the
+    /// layout math.
+    pub fn row_cell(&self, i: usize) -> Option<Rect> {
+        self.row_cells.cell(i)
+    }
+
+    /// The (row, direction) a click on a preset's ◀/▶ hits, if any.
+    pub fn preset_hit(&self, pos: Position) -> Option<(usize, i32)> {
+        self.preset_cells.hit(pos)
+    }
+
+    /// Where row `row`'s arrow in `dir` last drew, so a test can click it.
+    pub fn preset_cell(&self, row: usize, dir: i32) -> Option<Rect> {
+        self.preset_cells.cell((row, dir))
+    }
+
+    /// The open dropdown's option a click at `pos` hits, if any.
+    pub fn drop_hit(&self, pos: Position) -> Option<usize> {
+        self.drop_cells.hit(pos)
+    }
+
+    /// Where dropdown option `i` last drew, so a test can click it.
+    pub fn drop_cell(&self, i: usize) -> Option<Rect> {
+        self.drop_cells.cell(i)
     }
 
     /// The LineInput behind a text row, if `row` is one — the single row→field
@@ -244,6 +286,13 @@ impl App {
         // The row being edited scrolls under its cursor. Only that row: the rest
         // are not being typed into, so their overflow is just clipped.
         let scroll = cv.text_input(cv.row).map(|inp| hscroll(inp.cursor, value_w));
+        // row i sits on line 1 + 2i; scroll only if the box is too short.
+        // The action row (the last) has no line of its own — clamping to the
+        // last setting is what stops the list lurching when you land on it.
+        let line_of = |i: usize| 1 + i as u16 * 2;
+        let voff = line_of(cv.row.min(labels.len() - 1)).saturating_sub(inner.height.saturating_sub(1));
+        cv.row_cells.clear();
+        cv.preset_cells.clear();
         let mut lines: Vec<Line> = vec![Line::raw("")]; // lead blank, like every box
         for (i, label) in labels.iter().enumerate() {
             let sel = i == cv.row;
@@ -265,22 +314,33 @@ impl App {
                 Some((off, _)) => value.chars().skip(off as usize).take(value_w).collect(),
                 None => value,
             };
+            // On-screen rect for this row, if the scroll didn't carry it out
+            // of view — a click focuses it, same as landing here with ↓/↑.
+            let ly = line_of(i);
+            if ly >= voff && ly - voff < inner.height {
+                let ry = inner.y + (ly - voff);
+                cv.row_cells.push(i, Rect { x: inner.x, y: ry, width: inner.width, height: 1 });
+                // The preset rows' ◀/▶ live at the value's first and last two
+                // columns — narrower than the row, so a click there wins the
+                // hit-test and cycles instead of only focusing.
+                if (i == 0 || i == 4) && value.chars().count() >= 2 {
+                    let vlen = value.chars().count() as u16;
+                    let vx = inner.x + 19;
+                    cv.preset_cells.push((i, -1), Rect { x: vx, y: ry, width: 2, height: 1 });
+                    cv.preset_cells.push((i, 1), Rect { x: vx + vlen - 2, y: ry, width: 2, height: 1 });
+                }
+            }
             lines.push(Line::from(vec![
                 Span::raw(if sel { " ▶ " } else { "   " }),
                 Span::styled(format!("{label:<15} "), dim),
                 Span::styled(value, if sel { sel_style } else { Style::new() }),
             ]));
         }
-        // row i sits on line 1 + 2i; scroll only if the box is too short.
-        // The action row (the last) has no line of its own — clamping to the
-        // last setting is what stops the list lurching when you land on it.
-        let y = 1 + cv.row.min(labels.len() - 1) as u16 * 2;
-        let off = y.saturating_sub(inner.height.saturating_sub(1));
-        f.render_widget(Paragraph::new(lines).scroll((off, 0)), inner);
+        f.render_widget(Paragraph::new(lines).scroll((voff, 0)), inner);
         // `text_input` is the one row→field table, shared with the key
         // handler — the cursor cannot sit on a row the keys don't edit.
         if let Some((_, cx)) = scroll {
-            f.set_cursor_position(Position::new(inner.x + 19 + cx, inner.y + y - off));
+            f.set_cursor_position(Position::new(inner.x + 19 + cx, inner.y + line_of(cv.row) - voff));
         }
         // model version dropdown, overlaying the seat rows
         if let Some((sel, options)) = &cv.drop {
@@ -306,10 +366,24 @@ impl App {
                     )
                 })
                 .collect();
-            f.render_widget(
-                Paragraph::new(dlines).scroll((sel.saturating_sub(dinner.height.saturating_sub(1) as usize) as u16, 0)),
-                dinner,
-            );
+            let doff = sel.saturating_sub(dinner.height.saturating_sub(1) as usize) as u16;
+            f.render_widget(Paragraph::new(dlines).scroll((doff, 0)), dinner);
+            cv.drop_cells.clear();
+            for i in 0..options.len() {
+                let ly = i as u16;
+                if ly < doff {
+                    continue;
+                }
+                if ly - doff >= dinner.height {
+                    break;
+                }
+                cv.drop_cells.push(
+                    i,
+                    Rect { x: dinner.x, y: dinner.y + (ly - doff), width: dinner.width, height: 1 },
+                );
+            }
+        } else {
+            cv.drop_cells.clear();
         }
     }
 

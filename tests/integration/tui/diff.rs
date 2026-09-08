@@ -85,7 +85,8 @@ index 31d3074..efb9aa1 100644
 fn the_list_draws_closed_and_opens_one_row_at_a_time() {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
-    let mut v = DiffView { sections: patch_sections(PATCH), ..Default::default() };
+    let mut v = DiffView::default();
+    v.sections = patch_sections(PATCH);
     let draw = |v: &DiffView| -> String {
         let mut t = Terminal::new(TestBackend::new(60, 12)).unwrap();
         t.draw(|f| render_diff(f, Rect::new(0, 0, 60, 12), v)).unwrap();
@@ -95,29 +96,27 @@ fn the_list_draws_closed_and_opens_one_row_at_a_time() {
     assert!(closed.contains("▸ modified src/a.js"), "{closed}");
     assert!(closed.contains("▸ new      test/b.test.js"), "{closed}");
     assert!(!closed.contains("new line"), "no hunks until you ask: {closed}");
-    v.handle(&press(KeyCode::Char(' ')));
+    v.handle(&press(KeyCode::Tab));
     let open = draw(&v);
     assert!(open.contains("▾ modified src/a.js"), "the marker turns: {open}");
     assert!(open.contains("+new line"), "and the hunk is there: {open}");
     assert!(open.contains("▸ new      test/b.test.js"), "the other stays shut: {open}");
 }
 
-/// The cursor walks the rows, space opens one, and an open row pushes the
+/// The cursor walks the rows, tab opens one, and an open row pushes the
 /// rows under it down — which is what `head_y` has to know for the scroll.
 #[test]
-fn space_opens_a_row_and_moves_the_ones_below_it() {
-    let mut v = DiffView {
-        sections: patch_sections(PATCH),
-        ..Default::default()
-    };
+fn tab_opens_a_row_and_moves_the_ones_below_it() {
+    let mut v = DiffView::default();
+    v.sections = patch_sections(PATCH);
     // Built directly (no render_diff pass), so body_w defaults to 0; set
     // it wide enough that this fixture's body lines don't actually wrap,
     // so head_y still counts one row per body line below.
     v.body_w.set(200);
     assert_eq!(v.head_y(0), 1);
     assert_eq!(v.head_y(1), 2, "collapsed rows are one line each");
-    assert!(v.handle(&press(KeyCode::Char(' '))));
-    assert!(v.sections[0].open, "space opens the row under the cursor");
+    assert!(v.handle(&press(KeyCode::Tab)));
+    assert!(v.sections[0].open, "tab opens the row under the cursor");
     // 4 body lines (@@, -, +, context) + a trailing blank
     assert_eq!(v.head_y(1), 7, "the row below is pushed past the body");
     assert!(v.handle(&press(KeyCode::Down)));

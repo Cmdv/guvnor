@@ -136,6 +136,36 @@ fn the_stage_box_explains_itself_in_each_state() {
     assert!(text(&v).contains("NOT in the commit") && text(&v).contains("src/a.js"));
 }
 
+/// A click in the message box hands it the keyboard; a click on a button
+/// fires exactly what ↵ would, by replaying it.
+#[test]
+fn clicking_the_message_box_or_a_button_acts_like_the_keyboard() {
+    use guvnor::tui::{click, CommitFocus};
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+    use ratatui::Terminal;
+    let mut v = CommitView::new("x".into());
+    v.focus = CommitFocus::Actions;
+    let mut app = App::for_test();
+    app.commit = Some(v);
+    let (w, h) = (100, 20);
+    let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+    t.draw(|f| app.render_commit(f, Rect::new(0, 0, w, h))).unwrap();
+    let msg = app.commit.as_ref().unwrap().msg_rect();
+
+    app.handle_mouse(&click(msg.x + 1, msg.y));
+    assert!(
+        app.commit.as_ref().unwrap().focus == CommitFocus::Message,
+        "the click focused the message box"
+    );
+
+    // the armed "copy" button, with nothing typed: it must fire like ↵
+    // would (report rather than silently copy an empty string)
+    let cell = app.commit.as_ref().unwrap().buttons.cell(1).expect("the copy button drew somewhere");
+    app.handle_mouse(&click(cell.x + 1, cell.y + 1));
+    assert!(app.toast.as_ref().unwrap().0.contains("nothing to copy"), "the click fired the button");
+}
+
 #[test]
 fn landed_runs_are_named_in_the_past_tense() {
     // the run list and the tab strip read this: a staged run is not a
