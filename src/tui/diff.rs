@@ -1,11 +1,11 @@
 //! The Tests and Work tabs' bodies: a magit-style file list. One row per file,
-//! `space` drops it open. The plumbing of a git patch (`index`, `---`, `+++`,
+//! `tab` drops it open. The plumbing of a git patch (`index`, `---`, `+++`,
 //! the `diff --git` line itself) says nothing the row doesn't, so none of it
 //! reaches the screen.
 
 use super::*;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -59,9 +59,22 @@ pub struct DiffView {
     /// Width the last frame wrapped body lines to, so `head_y` can reproduce
     /// the same wrapped row count `render_diff` actually drew.
     pub body_w: Cell<u16>,
+    /// Each visible section header's last-drawn rect, for a click to hit.
+    cells: Cells<usize>,
 }
 
 impl DiffView {
+    /// Which section a click at `pos` hits, if its header row is on screen.
+    pub fn hit(&self, pos: Position) -> Option<usize> {
+        self.cells.hit(pos)
+    }
+
+    /// Where section `i`'s header last drew, so a test can click it without
+    /// knowing the layout math.
+    pub fn cell(&self, i: usize) -> Option<Rect> {
+        self.cells.cell(i)
+    }
+
     /// A gate tab: one section per file in `patch`, then the evidence — the
     /// thing that makes the patch worth anything — as one more collapsed row.
     pub fn build(
@@ -117,7 +130,7 @@ impl DiffView {
                 self.sel = self.sel.saturating_sub(1);
                 self.show_sel();
             }
-            KeyCode::Char(' ') => {
+            KeyCode::Tab => {
                 self.sections[self.sel].open = !self.sections[self.sel].open;
                 self.show_sel();
             }
@@ -251,5 +264,21 @@ pub fn render_diff(f: &mut Frame, area: Rect, v: &DiffView) {
     // and the cursor's row never disagree.
     let total = lines.len();
     let off = v.scroll.fit(total, area.height);
+    // Reuses `head_y` rather than re-deriving row positions: one definition
+    // of "where does section i's header land" for the cursor's scroll-into-
+    // view and a click's hit-test to agree on.
+    v.cells.clear();
+    for i in 0..v.sections.len() {
+        let y = v.head_y(i);
+        if y < off {
+            continue;
+        }
+        let row = y - off;
+        if row >= area.height {
+            break;
+        }
+        v.cells.push(i, Rect { x: area.x, y: area.y + row, width: area.width, height: 1 });
+    }
     f.render_widget(Paragraph::new(lines).scroll((off, 0)), area);
+    v.scroll.render_bar(f, area);
 }

@@ -2,9 +2,9 @@ use guvnor::digest;
 use guvnor::spec::Spec;
 use guvnor::state::{self, State, Status};
 use guvnor::tui::{
-    click, line_text, next_step, press, screen_text, spec_drifted, spec_sha, status_badge,
-    tab_gate, App, CaseView, FAIL_TAB, Go, ReviewFocus, ReviewView, Scroll, Screen, SpecPanels,
-    StageView, REVIEW_TAB, TABS,
+    click, line_text, next_step, patch_sections, press, screen_text, spec_drifted, spec_sha,
+    status_badge, tab_gate, App, CaseView, FAIL_TAB, Go, Prompt, ReviewFocus, ReviewView, Scroll,
+    Screen, SpecPanels, StageView, REVIEW_TAB, TABS,
 };
 use ratatui::layout::Rect;
 use ratatui::style::Color;
@@ -90,6 +90,35 @@ fn a_spec_digit_zooms_and_esc_unzooms_before_it_leaves_the_screen() {
     assert!(!v.panels.zoomed);
 
     // now esc means what it always means on this screen: leave for Runs
+    assert!(matches!(app.handle_key(&press(KeyCode::Esc)), Some(Go::Runs)));
+}
+
+/// Landing on Review always lands on Findings, unzoomed — stale focus from a
+/// previous visit does not survive the tab strip — and a zoomed pane's esc
+/// stays on this screen, same as the Spec tab.
+#[test]
+fn arriving_at_review_focuses_findings_and_esc_only_unzooms() {
+    use ratatui::crossterm::event::KeyCode;
+    let mut v = view(vec![0, 1, 2, REVIEW_TAB], vec![0, 1, 2, REVIEW_TAB]);
+    v.tab = 2;
+    let mut r = ReviewView::stub(2, None);
+    r.focus = ReviewFocus::Cost;
+    r.zoomed = true;
+    v.review = Some(Box::new(r));
+    let mut app = App::for_test();
+    app.screen = Screen::Case(Box::new(v));
+
+    assert!(app.handle_key(&press(KeyCode::Right)).is_none());
+    let Screen::Case(v) = &app.screen else { unreachable!() };
+    assert_eq!(v.tab, REVIEW_TAB);
+    let r = v.review.as_ref().unwrap();
+    assert!(r.focus == ReviewFocus::Findings && !r.zoomed, "stale Cost zoom must not survive arrival");
+
+    // zoom again, then esc: the run screen holds, only the zoom drops
+    assert!(app.handle_key(&press(KeyCode::Char('3'))).is_none());
+    assert!(app.handle_key(&press(KeyCode::Esc)).is_none(), "esc unzooms first");
+    let Screen::Case(v) = &app.screen else { unreachable!() };
+    assert!(!v.review.as_ref().unwrap().zoomed);
     assert!(matches!(app.handle_key(&press(KeyCode::Esc)), Some(Go::Runs)));
 }
 
@@ -415,4 +444,214 @@ fn clicking_a_tab_selects_it_and_a_greyed_one_is_a_no_op() {
     app.handle_mouse(&click(work_cell.x + 1, work_cell.y + 1));
     let Screen::Case(v) = &app.screen else { unreachable!() };
     assert_eq!(v.tab, 1, "a greyed tab is not a click target either");
+}
+
+/// A click selects a pane the same way tab/backtab would — it must not also
+/// zoom it. Zoom stays a deliberate keypress (its number), not a side effect
+/// of pointing.
+#[test]
+fn clicking_a_spec_panel_focuses_it_without_zooming() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    let mut v = view(vec![0], vec![0, 1, 2]);
+    v.spec = Some(Spec {
+        title: "t".into(),
+        objective: "o".into(),
+        files: vec![],
+        interfaces: vec![],
+        constraints: vec![],
+        verification: "true".into(),
+        acceptance_criteria: vec![],
+    });
+    let mut app = App::for_test();
+    app.screen = Screen::Case(Box::new(v));
+    let (w, h) = (100, 30);
+    let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+    t.draw(|f| app.render_case(f, Rect::new(0, 0, w, h))).unwrap();
+    let Screen::Case(v) = &app.screen else { unreachable!() };
+    let cell = v.panels.cell(2).expect("panel 3 (Interfaces) drew somewhere");
+
+    app.handle_mouse(&click(cell.x + 1, cell.y + 1));
+    let Screen::Case(v) = &app.screen else { unreachable!() };
+    assert_eq!(v.panels.focus, 2, "the click landed on the panel it hit");
+    assert!(!v.panels.zoomed, "a click must only focus, never zoom");
+}
+
+/// Same contract on the Review tab: a click picks a pane, it does not zoom
+/// it, and it never fires a button that happens to sit under a pane's rect.
+#[test]
+fn clicking_a_review_pane_focuses_it_without_zooming() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    let mut v = view(vec![0, 1, 2, REVIEW_TAB], vec![0, 1, 2, REVIEW_TAB]);
+    v.tab = REVIEW_TAB;
+    v.review = Some(Box::new(ReviewView::stub(1, None)));
+    let mut app = App::for_test();
+    app.screen = Screen::Case(Box::new(v));
+    let (w, h) = (100, 30);
+    let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+    t.draw(|f| app.render_case(f, Rect::new(0, 0, w, h))).unwrap();
+    let Screen::Case(v) = &app.screen else { unreachable!() };
+    let r = v.review.as_ref().unwrap();
+    let cell = r.cell(ReviewFocus::Cost).expect("the cost pane drew somewhere");
+
+    assert!(app.handle_mouse(&click(cell.x + 1, cell.y + 1)).is_none());
+    let Screen::Case(v) = &app.screen else { unreachable!() };
+    let r = v.review.as_ref().unwrap();
+    assert!(r.focus == ReviewFocus::Cost, "the click landed on the pane it hit");
+    assert!(!r.zoomed, "a click must only focus, never zoom");
+}
+
+/// A click on a button fires the exact thing `↵` would, by replaying it —
+/// there is one place that decides what a button does, and the mouse goes
+/// through it rather than around it.
+#[test]
+fn clicking_the_fix_button_fires_it_like_enter_would() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    let mut r = ReviewView::stub(1, None);
+    r.checked[0] = true; // something ticked, so the button actually fires
+    let mut v = view(vec![0, 1, 2, REVIEW_TAB], vec![0, 1, 2, REVIEW_TAB]);
+    v.tab = REVIEW_TAB;
+    r.id = v.id.clone();
+    let id = v.id.clone();
+    v.review = Some(Box::new(r));
+    let mut app = App::for_test();
+    app.screen = Screen::Case(Box::new(v));
+    let (w, h) = (100, 30);
+    let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+    t.draw(|f| app.render_case(f, Rect::new(0, 0, w, h))).unwrap();
+    let Screen::Case(v) = &app.screen else { unreachable!() };
+    let cell = v.review.as_ref().unwrap().buttons.cell(0).expect("fix button drew somewhere");
+
+    let go = app.handle_mouse(&click(cell.x + 1, cell.y + 1));
+    assert!(matches!(go, Some(Go::Fix(fid, ..)) if fid == id), "the click should fire the button");
+}
+
+/// A click on the instruction box gives it the same focus landing on it via
+/// the keyboard would — findings focused, cursor on the note row — rather
+/// than only focusing the findings pane in general.
+#[test]
+fn clicking_the_review_note_box_focuses_it() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    let mut v = view(vec![0, 1, 2, REVIEW_TAB], vec![0, 1, 2, REVIEW_TAB]);
+    v.tab = REVIEW_TAB;
+    let mut r = ReviewView::stub(1, None);
+    r.focus = ReviewFocus::Cost; // start elsewhere, so the click has to move it
+    v.review = Some(Box::new(r));
+    let mut app = App::for_test();
+    app.screen = Screen::Case(Box::new(v));
+    let (w, h) = (100, 30);
+    let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+    t.draw(|f| app.render_case(f, Rect::new(0, 0, w, h))).unwrap();
+    let Screen::Case(v) = &app.screen else { unreachable!() };
+    let note = v.review.as_ref().unwrap().note_rect();
+
+    app.handle_mouse(&click(note.x + 1, note.y));
+    let Screen::Case(v) = &app.screen else { unreachable!() };
+    let r = v.review.as_ref().unwrap();
+    assert!(r.focus == ReviewFocus::Findings, "the click focused the findings section");
+    assert_eq!(r.sel, r.note_row(), "and landed the cursor on the note row");
+}
+
+/// A click on a finding's words (right of the checkbox) selects it — so the
+/// why-pane follows the click — without touching its ticked state.
+#[test]
+fn clicking_a_finding_selects_it_without_ticking() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    let mut v = view(vec![0, 1, 2, REVIEW_TAB], vec![0, 1, 2, REVIEW_TAB]);
+    v.tab = REVIEW_TAB;
+    v.review = Some(Box::new(ReviewView::stub(2, None)));
+    let mut app = App::for_test();
+    app.screen = Screen::Case(Box::new(v));
+    // Tall enough that both finding rows are actually on screen at once.
+    let (w, h) = (100, 50);
+    let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+    t.draw(|f| app.render_case(f, Rect::new(0, 0, w, h))).unwrap();
+    let Screen::Case(v) = &app.screen else { unreachable!() };
+    let row = v.review.as_ref().unwrap().finding_cell(1).expect("row 1 drew somewhere");
+
+    // Past the checkbox, on the severity/file text.
+    assert!(app.handle_mouse(&click(row.x + 20, row.y)).is_none());
+    let Screen::Case(v) = &app.screen else { unreachable!() };
+    let r = v.review.as_ref().unwrap();
+    assert_eq!(r.sel, 1, "the click selected the row it hit");
+    assert!(!r.checked[1], "a click off the checkbox must not tick it");
+}
+
+/// A click on a finding's checkbox glyph ticks it (and selects the row, same
+/// as any other click on it); a second click un-ticks.
+#[test]
+fn clicking_a_findings_checkbox_ticks_it() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    let mut v = view(vec![0, 1, 2, REVIEW_TAB], vec![0, 1, 2, REVIEW_TAB]);
+    v.tab = REVIEW_TAB;
+    v.review = Some(Box::new(ReviewView::stub(1, None)));
+    let mut app = App::for_test();
+    app.screen = Screen::Case(Box::new(v));
+    let (w, h) = (100, 30);
+    let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+    t.draw(|f| app.render_case(f, Rect::new(0, 0, w, h))).unwrap();
+    let Screen::Case(v) = &app.screen else { unreachable!() };
+    let check = v.review.as_ref().unwrap().check_cell(0).expect("the checkbox drew somewhere");
+
+    assert!(app.handle_mouse(&click(check.x + 1, check.y)).is_none());
+    let Screen::Case(v) = &app.screen else { unreachable!() };
+    let r = v.review.as_ref().unwrap();
+    assert!(r.checked[0], "the click ticked the finding");
+    assert_eq!(r.sel, 0, "and selected it");
+
+    app.handle_mouse(&click(check.x + 1, check.y));
+    let Screen::Case(v) = &app.screen else { unreachable!() };
+    assert!(!v.review.as_ref().unwrap().checked[0], "a second click un-ticks it");
+}
+
+/// A click in the feedback popup's text area must hand it the keyboard back
+/// — it must not leave the buttons armed underneath it.
+#[test]
+fn clicking_the_feedback_text_area_leaves_the_buttons() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    let mut v = view(vec![0], vec![0, 1, 2]);
+    v.feedback = Some(Prompt { on_buttons: true, ..Default::default() });
+    let mut app = App::for_test();
+    app.screen = Screen::Case(Box::new(v));
+    let (w, h) = (100, 30);
+    let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+    t.draw(|f| app.render_case(f, Rect::new(0, 0, w, h))).unwrap();
+    let Screen::Case(v) = &app.screen else { unreachable!() };
+    let text = v.feedback.as_ref().unwrap().text_cell.get();
+
+    app.handle_mouse(&click(text.x + 1, text.y));
+    let Screen::Case(v) = &app.screen else { unreachable!() };
+    assert!(!v.feedback.as_ref().unwrap().on_buttons, "the click moved focus off the buttons");
+}
+
+/// A click on a file row does what `tab` does to it — opens or closes that
+/// row — having first moved the cursor there, same as a keyboard `↓` would.
+#[test]
+fn clicking_a_diff_row_opens_it_like_tab_would() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    let mut v = view(vec![0, 1], vec![0, 1, 2]);
+    v.tab = 1;
+    v.diffs[0].sections = patch_sections(
+        "diff --git a/src/a.js b/src/a.js\nindex d10..588 100644\n--- a/src/a.js\n\
+         +++ b/src/a.js\n@@ -1,2 +1,2 @@\n-old\n+new\n context\n",
+    );
+    let mut app = App::for_test();
+    app.screen = Screen::Case(Box::new(v));
+    let (w, h) = (100, 20);
+    let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+    t.draw(|f| app.render_case(f, Rect::new(0, 0, w, h))).unwrap();
+    let Screen::Case(v) = &app.screen else { unreachable!() };
+    let cell = v.diffs[0].cell(0).expect("the row drew somewhere");
+
+    assert!(app.handle_mouse(&click(cell.x + 1, cell.y)).is_none());
+    let Screen::Case(v) = &app.screen else { unreachable!() };
+    assert_eq!(v.diffs[0].sel, 0, "the click selected the row it hit");
+    assert!(v.diffs[0].sections[0].open, "and opened it, the same as tab");
 }

@@ -379,10 +379,16 @@ impl App {
                 }
                 let Screen::Case(v) = &mut self.screen else { return None };
                 match key.code {
-                    // A zoomed spec panel eats its own esc — leaving the run
-                    // screen is one esc further out, same as any other popup.
+                    // A zoomed pane eats its own esc — leaving the run screen
+                    // is one esc further out, same as any other popup.
                     KeyCode::Esc if v.tab == 0 && v.panels.zoomed => {
                         v.panels.zoomed = false;
+                        None
+                    }
+                    KeyCode::Esc if v.tab == REVIEW_TAB && v.review.as_deref().is_some_and(|r| r.zoomed) => {
+                        if let Some(r) = &mut v.review {
+                            r.zoomed = false;
+                        }
                         None
                     }
                     KeyCode::Esc => Some(Go::Runs),
@@ -437,7 +443,13 @@ impl App {
                     // more lanes, so it asks first. The first run has nothing to
                     // lose and nothing to ask about.
                     KeyCode::Char('r') if v.live.contains(&1) => {
-                        v.confirm = Some((Ask::Rerun, Buttons::new(&["cancel", "re-run"], YES_NO)));
+                        // `cancel` sits at 0 for the safe preselection, but it
+                        // is still the refusal — `YES_NO` is positional (green
+                        // first) and would colour it as the answer instead.
+                        v.confirm = Some((
+                            Ask::Rerun,
+                            Buttons::new(&["cancel", "re-run"], &[Color::Red, Color::Green]),
+                        ));
                         None
                     }
                     KeyCode::Char('r') => Some(Go::Run(v.id.clone())),
@@ -522,17 +534,145 @@ impl App {
         }
     }
 
-    /// Mirrors `handle_key`, for clicks. Only the Case screen's tab strip
-    /// answers today; everything else is a deliberate `None`.
+    /// Mirrors `handle_key`, for clicks. A hit that should *act* (a button,
+    /// a run row) sets the same selection the keyboard would and replays it
+    /// as `↵` (or, for the config box, `c`) — so there is exactly one place
+    /// that decides what each of those does. A hit that should only *focus*
+    /// something (a pane, a field) sets that directly. Everything else is a
+    /// deliberate `None`.
     pub fn handle_mouse(&mut self, m: &MouseEvent) -> Option<Go> {
         if m.kind != MouseEventKind::Down(MouseButton::Left) {
             return None;
         }
         let pos = Position::new(m.column, m.row);
-        if let Screen::Case(v) = &mut self.screen {
-            if let Some(k) = hit_test(&v.tab_cells, pos) {
-                v.goto(v.shown[k]);
+        // The commit modal draws on top of everything on the Case screen and
+        // takes every key itself (`commit_open()`'s precedence in
+        // `handle_key`) — so a click goes straight to `commit_key` rather
+        // than through the screen-keyed replay below.
+        if self.commit.as_ref().is_some_and(|c| c.open) {
+            let fire = {
+                let v = self.commit.as_mut().expect("checked above");
+                if let Some(i) = v.buttons.hit(pos) {
+                    v.buttons.sel = i;
+                    v.focus = CommitFocus::Actions;
+                    true
+                } else {
+                    if v.msg_hit(pos) {
+                        v.focus = CommitFocus::Message;
+                    }
+                    false
+                }
+            };
+            if fire {
+                return commit_key(self, &press(KeyCode::Enter));
             }
+            return None;
+        }
+        let mut replay: Option<KeyEvent> = None;
+        if let Screen::Case(v) = &mut self.screen {
+            if let Some((_, buttons)) = v.confirm.as_mut() {
+                if let Some(i) = buttons.hit(pos) {
+                    buttons.sel = i;
+                    replay = Some(press(KeyCode::Enter));
+                }
+            } else if let Some(fb) = v.feedback.as_mut() {
+                if let Some(i) = fb.buttons.hit(pos) {
+                    fb.buttons.sel = i;
+                    fb.on_buttons = true;
+                    replay = Some(press(KeyCode::Enter));
+                } else if fb.text_cell.get().contains(pos) {
+                    fb.on_buttons = false;
+                }
+            } else if let Some(k) = hit_test(&v.tab_cells, pos) {
+                v.goto(v.shown[k]);
+            } else if v.tab == 0 {
+                if let Some(k) = v.panels.hit(pos) {
+                    v.panels.focus = k;
+                }
+            } else if (1..=2).contains(&v.tab) {
+                // Same toggle `tab` fires, on whichever row the click hit —
+                // select it, then replay the keypress rather than duplicate
+                // what it does to `sel`/`open`/the scroll-into-view.
+                let d = &mut v.diffs[v.tab - 1];
+                if let Some(i) = d.hit(pos) {
+                    d.sel = i;
+                    d.handle(&press(KeyCode::Tab));
+                }
+            } else if v.tab == REVIEW_TAB {
+                if let Some(r) = v.review.as_deref_mut() {
+                    // Buttons and the note box sit inside a pane's rect, so
+                    // they must win the hit-test before the pane itself, or
+                    // a click on one could only ever focus the pane around it.
+                    if let Some(i) = r.buttons.hit(pos) {
+                        r.sel = r.action_row();
+                        r.buttons.sel = i;
+                        replay = Some(press(KeyCode::Enter));
+                    } else if let Some(i) = r.stage.as_ref().and_then(|s| s.buttons.hit(pos)) {
+                        r.stage.as_mut().expect("hit above").buttons.sel = i;
+                        r.focus = ReviewFocus::Stage;
+                        replay = Some(press(KeyCode::Enter));
+                    } else if let Some(i) = r.check_hit(pos) {
+                        r.focus = ReviewFocus::Findings;
+                        r.sel = i;
+                        r.checked[i] = !r.checked[i];
+                    } else if let Some(i) = r.finding_hit(pos) {
+                        r.focus = ReviewFocus::Findings;
+                        r.sel = i;
+                    } else if r.note_hit(pos) {
+                        r.focus = ReviewFocus::Findings;
+                        r.sel = r.note_row();
+                    } else if let Some(k) = r.hit(pos) {
+                        r.focus = k;
+                    }
+                }
+            }
+        } else if matches!(self.screen, Screen::Runs) {
+            if let Some(cv) = self.config.as_mut() {
+                if cv.drop.is_some() {
+                    // The dropdown is a popup over the modal: a click picks
+                    // an option directly, same as ↑↓ then ↵ would.
+                    if let Some(i) = cv.drop_hit(pos) {
+                        if let Some((sel, _)) = cv.drop.as_mut() {
+                            *sel = i;
+                        }
+                        replay = Some(press(KeyCode::Enter));
+                    }
+                } else if let Some(i) = cv.buttons.hit(pos) {
+                    cv.row = CFG_ROWS - 1;
+                    cv.buttons.sel = i;
+                    replay = Some(press(KeyCode::Enter));
+                } else if let Some((row, dir)) = cv.preset_hit(pos) {
+                    // Narrower than the row, so it wins: ◀/▶ cycle
+                    // immediately instead of only focusing the row.
+                    cv.row = row;
+                    replay = Some(press(if dir < 0 { KeyCode::Left } else { KeyCode::Right }));
+                } else if let Some(i) = cv.row_hit(pos) {
+                    cv.row = i;
+                    // ↵ is a no-op on every row except the model seats,
+                    // where it opens the dropdown — same as landing here
+                    // with ↓ and pressing it would do.
+                    replay = Some(press(KeyCode::Enter));
+                }
+            } else if let Some((_, _, buttons)) = self.confirm_delete.as_mut() {
+                if let Some(i) = buttons.hit(pos) {
+                    buttons.sel = i;
+                    replay = Some(press(KeyCode::Enter));
+                }
+            } else if let Some(i) = self.row_cells.hit(pos) {
+                self.focus = HomeFocus::Runs;
+                self.table.select(Some(i));
+                replay = Some(press(KeyCode::Enter));
+            } else if let Some(k) = self.new.hit(pos) {
+                self.focus = HomeFocus::New;
+                self.new.focus = k;
+            } else if self.cfg_box.contains(pos) {
+                replay = Some(press(KeyCode::Char('c')));
+            } else if self.runs_box.contains(pos) {
+                self.focus = HomeFocus::Runs;
+            }
+        }
+        if let Some(k) = replay {
+            return self.handle_key(&k);
         }
         None
     }

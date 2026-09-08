@@ -5,7 +5,7 @@ use crate::spec::Spec;
 use crate::state::{self, State, Status};
 use crate::digest;
 use anyhow::Result;
-use ratatui::layout::{Constraint, Flex, Layout, Position, Rect};
+use ratatui::layout::{Constraint, Flex, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -148,8 +148,7 @@ impl CaseView {
             i = (i + d).rem_euclid(n);
             let t = self.shown[i as usize];
             if self.live.contains(&t) {
-                self.tab = t;
-                self.scroll.top();
+                self.enter_tab(t);
                 return;
             }
         }
@@ -159,8 +158,19 @@ impl CaseView {
     /// move. A greyed tab is a no-op, same as the keyboard.
     pub fn goto(&mut self, t: usize) {
         if self.live.contains(&t) {
-            self.tab = t;
-            self.scroll.top();
+            self.enter_tab(t);
+        }
+    }
+
+    /// Land on tab `t`. Arriving at Review always lands on Findings — never
+    /// wherever it was last left, and never the note box.
+    fn enter_tab(&mut self, t: usize) {
+        self.tab = t;
+        self.scroll.top();
+        if t == REVIEW_TAB {
+            if let Some(r) = &mut self.review {
+                r.focus_findings();
+            }
         }
     }
 }
@@ -417,6 +427,7 @@ impl App {
                 let body = Paragraph::new(lines).wrap(Wrap { trim: false });
                 let off = v.scroll.fit(body.line_count(inner.width), inner.height);
                 f.render_widget(body.scroll((off, 0)).block(block), body_a);
+                v.scroll.render_bar(f, body_a.inner(Margin { vertical: 1, horizontal: 0 }));
             }
             // No title: same shared-seam row as every other body box.
             (REVIEW_TAB, None) => f.render_widget(
@@ -445,7 +456,7 @@ impl App {
                 let block = match v.tab {
                     1 | 2 => block.title_bottom(hint_line(&[
                         ("↑↓", "file"),
-                        ("space", "open / close"),
+                        ("tab", "open / close"),
                         ("↵", "judge"),
                     ])),
                     _ => block,
@@ -462,6 +473,7 @@ impl App {
                             Paragraph::new(v.spec_lines.clone()).wrap(Wrap { trim: false });
                         let off = v.scroll.fit(body.line_count(inner.width), inner.height);
                         f.render_widget(body.scroll((off, 0)), inner);
+                        v.scroll.render_bar(f, body_a.inner(Margin { vertical: 1, horizontal: 0 }));
                     }
                 }
             }
@@ -519,6 +531,7 @@ impl App {
             f.render_widget(block, popup);
             let [text_a, btn_a] =
                 Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).areas(inner);
+            fb.text_cell.set(text_a);
             fb.buttons.render(f, btn_a, fb.on_buttons);
             render_textarea(f, text_a, &fb.text, !fb.on_buttons);
         }

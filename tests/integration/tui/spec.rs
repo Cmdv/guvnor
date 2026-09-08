@@ -117,6 +117,43 @@ fn pressing_a_number_zooms_the_box_to_the_whole_tab() {
     assert!(text.contains("1 Objective") && text.contains("2 Files"), "unzoomed is the grid again:\n{text}");
 }
 
+/// Verification is one line (the test command), but a single-content-row box
+/// reads as cramped next to its neighbours — it always gets at least two.
+#[test]
+fn verification_box_is_never_a_single_content_row() {
+    let (w, h) = (120, 40);
+    let text = screen(w, h, &SpecPanels::default());
+    let row = |label: &str| text.lines().position(|l| l.contains(label)).unwrap();
+    let verification = row("6 Acceptance criteria") - row("5 Verification");
+    assert!(
+        verification >= 4,
+        "verification box only {verification} rows (want >=4: 2 border + 2 content):\n{text}"
+    );
+}
+
+/// A box only gets a scrollbar when it actually has more content than room —
+/// one that already fits stays clean instead of showing a bar frozen at 100%.
+#[test]
+fn a_box_only_gets_a_scrollbar_when_its_content_overflows() {
+    let mut sp = spec();
+    sp.acceptance_criteria = (1..=30).map(|n| format!("criterion number {n}")).collect();
+    let mut p = SpecPanels::default();
+    p.focus = 5; // Acceptance criteria
+    p.zoomed = true;
+
+    let cramped = screen_of(60, 15, &p, &sp);
+    assert!(
+        cramped.contains('█') || cramped.contains('║'),
+        "overflowing box should show a scrollbar:\n{cramped}"
+    );
+
+    let roomy = screen_of(60, 40, &p, &sp);
+    assert!(
+        !roomy.contains('█') && !roomy.contains('║'),
+        "a box with nothing to scroll must stay clean:\n{roomy}"
+    );
+}
+
 /// Tab/backtab are the digits' next/prev: the same six boxes, walked in
 /// order instead of jumped to, wrapping at both ends so it is a cycle rather
 /// than a dead stop.

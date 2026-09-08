@@ -41,6 +41,8 @@ pub struct NewView {
     /// 0 title · 1 context. Tab cycles. No action row: ↵ submits and esc
     /// cancels, which is two fewer things on screen than a row saying so.
     pub focus: usize,
+    /// The two fields' last-drawn rects (0 title, 1 context), for a click.
+    cells: Cells<usize>,
 }
 
 impl Default for NewView {
@@ -49,7 +51,21 @@ impl Default for NewView {
             title: LineInput { max: TITLE_MAX, ..Default::default() },
             context: TextArea::default(),
             focus: 0,
+            cells: Cells::default(),
         }
+    }
+}
+
+impl NewView {
+    /// Which field (0 title, 1 context) a click at `pos` hits.
+    pub fn hit(&self, pos: Position) -> Option<usize> {
+        self.cells.hit(pos)
+    }
+
+    /// Where field `i` last drew, so a test can click it without knowing
+    /// the layout math.
+    pub fn cell(&self, i: usize) -> Option<Rect> {
+        self.cells.cell(i)
     }
 }
 
@@ -147,6 +163,11 @@ impl App {
             Constraint::Length(4),
         ])
         .areas(area);
+        // Both boxes are drawn every frame, so a click can target them
+        // straight away: the runs box (a fallback — a row is more specific)
+        // and the config box (click opens the modal, same as `c`).
+        self.runs_box = runs_a;
+        self.cfg_box = cfg_a;
         if art_h > 0 {
             // two 50/50 columns: logo left, new-feature panel right. The panel
             // fills its column and the whole row height (dictated by the logo).
@@ -177,6 +198,10 @@ impl App {
                 f.render_widget(Paragraph::new(art_lines(mask, Style::new().fg(ART_WHITE))), mc);
             }
             render_new_box(f, new_col, &self.new, self.focus == HomeFocus::New);
+        } else {
+            // not drawn this frame (too small): stale rects must not linger
+            // for a click to hit against a box that isn't on screen.
+            self.new.cells.clear();
         }
         // ---- runs section (filter-aware; actions on the border, btop-style)
         let mut block = boxed("runs", Style::new().bold());
@@ -202,6 +227,7 @@ impl App {
         }
         let vis = self.visible_idx();
         if vis.is_empty() {
+            self.row_cells.clear();
             let msg = if self.runs.is_empty() {
                 "\n  no runs yet — press n to plan a feature"
             } else {
@@ -265,6 +291,9 @@ impl App {
                     }
                 })
                 .collect();
+            // measured before `.block(block)` moves it — a plain border, one
+            // row for the header, then one row per visible run in order.
+            let table_inner = block.inner(runs_a);
             let table = Table::new(
                 rows,
                 [
@@ -278,6 +307,20 @@ impl App {
             .header(Row::new(["title", "status", "verdict", "cost", "gates"]).style(Style::new().bold().fg(Color::DarkGray)))
             .block(block);
             f.render_stateful_widget(table, runs_a, &mut self.table);
+            // offset is only current *after* the stateful render above keeps
+            // the selection on screen — read it back rather than guess it.
+            // Keyed by `pos` (the visible-list index `vis[pos]` maps to a
+            // run, and what `table.select` takes), not by screen row, so a
+            // scrolled list can't misalign a click with the row under it.
+            let top = self.table.offset();
+            self.row_cells.clear();
+            for pos in top..vis.len() {
+                let y = table_inner.y + 1 + (pos - top) as u16;
+                if y >= table_inner.y + table_inner.height {
+                    break;
+                }
+                self.row_cells.push(pos, Rect { x: table_inner.x, y, width: table_inner.width, height: 1 });
+            }
         }
         // ---- config section
         let dim = Style::new().fg(Color::DarkGray);
@@ -381,6 +424,9 @@ fn render_new_box(f: &mut Frame, slot: Rect, v: &NewView, focused: bool) {
     f.render_widget(block, slot);
     let [title_a, context_a] =
         Layout::vertical([Constraint::Length(3), Constraint::Min(3)]).areas(inner);
+    v.cells.clear();
+    v.cells.push(0, title_a);
+    v.cells.push(1, context_a);
     let (title_on, context_on) = (focused && v.focus == 0, focused && v.focus == 1);
     let title_block = boxed(&format!("feature title (max {TITLE_MAX} chars)"), grey)
         .border_style(border(title_on))

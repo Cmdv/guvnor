@@ -214,6 +214,14 @@ pub struct App {
     pub cfg_models: Option<[String; 3]>, // planner/worker/reviewer for the config box
     pub runs: Vec<RunRow>,
     pub table: TableState,
+    /// Each visible run row's last-drawn rect, keyed by its position in
+    /// `visible_idx()` — what `table.select` takes — for a click to hit.
+    pub row_cells: Cells<usize>,
+    /// The runs box and the config box, whole: a click anywhere in the
+    /// former (that isn't a row) just focuses it; anywhere in the latter
+    /// opens the config modal, same as `c`.
+    pub runs_box: Rect,
+    pub cfg_box: Rect,
     pub screen: Screen,
     pub job: Option<Job>,
     pub toast: Option<(String, Instant)>,
@@ -242,6 +250,9 @@ impl App {
             cfg_models: None,
             runs: Vec::new(),
             table: TableState::default(),
+            row_cells: Cells::default(),
+            runs_box: Rect::default(),
+            cfg_box: Rect::default(),
             screen: Screen::Runs,
             job: None,
             toast: None,
@@ -369,6 +380,9 @@ impl App {
             cfg_models: None,
             runs: Vec::new(),
             table: TableState::default(),
+            row_cells: Cells::default(),
+            runs_box: Rect::default(),
+            cfg_box: Rect::default(),
             screen: Screen::Runs,
             job: None,
             toast: None,
@@ -421,8 +435,6 @@ impl App {
                     }
                 }
                 Event::Paste(text) => self.handle_paste(&text),
-                // Only the Case screen's tab strip answers today. Every
-                // other screen is a deliberate `None` in `handle_mouse`.
                 Event::Mouse(m) => {
                     if let Some(go) = self.handle_mouse(&m) {
                         self.apply(go);

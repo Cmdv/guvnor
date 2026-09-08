@@ -318,6 +318,19 @@ fn armed_button_is_filled_edge_to_edge_and_both_keep_their_outline() {
     );
 }
 
+/// A click hits exactly what render drew, same contract as the tab strip.
+#[test]
+fn a_click_hits_the_button_render_drew_there() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    let b = Buttons::new(&["continue", "skip"], YES_NO);
+    let mut t = Terminal::new(TestBackend::new(40, 3)).unwrap();
+    t.draw(|f| b.render(f, Rect::new(0, 0, 40, 3), true)).unwrap();
+    assert_eq!(b.hit(Position::new(2, 1)), Some(0), "inside continue");
+    assert_eq!(b.hit(Position::new(18, 1)), Some(1), "inside skip");
+    assert_eq!(b.hit(Position::new(35, 1)), None, "past the last button");
+}
+
 #[test]
 fn buttons_row_is_the_only_way_to_act() {
     let mut b = Buttons::new(&["continue", "skip"], YES_NO);

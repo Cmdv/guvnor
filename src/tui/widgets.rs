@@ -5,9 +5,9 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Style};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use ratatui::Frame;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use super::*;
 
@@ -39,6 +39,20 @@ impl Scroll {
         // to a near-zero ceiling and refuse to scroll at all.
         self.max.set(u16::try_from(content).unwrap_or(u16::MAX).saturating_sub(h));
         self.off.min(self.max.get())
+    }
+
+    /// A thin vertical scrollbar over `area`'s right column, drawn only when
+    /// there's something to scroll — call after `fit`, on the same frame. A
+    /// bordered box should inset `area` top/bottom by one first, so the thumb
+    /// rides the border rather than a corner glyph; a borderless list passes
+    /// its plain content rect as-is.
+    pub fn render_bar(&self, f: &mut Frame, area: Rect) {
+        let max = self.max.get();
+        if max == 0 || area.height == 0 {
+            return;
+        }
+        let mut state = ScrollbarState::new(max as usize).position(self.off.min(max) as usize);
+        f.render_stateful_widget(Scrollbar::new(ScrollbarOrientation::VerticalRight), area, &mut state);
     }
 }
 
@@ -551,11 +565,24 @@ pub struct Buttons {
     /// a button *means* is only knowable there — short rows run out and fall
     /// back to grey.
     pub colors: &'static [Color],
+    /// Each button's last-drawn rect, for a click to hit-test against.
+    cells: Cells<usize>,
 }
 
 impl Buttons {
     pub fn new(labels: &'static [&'static str], colors: &'static [Color]) -> Self {
-        Self { labels, sel: 0, colors }
+        Self { labels, sel: 0, colors, cells: Cells::default() }
+    }
+
+    /// The button a click at `pos` hits, if the last render drew one there.
+    pub fn hit(&self, pos: Position) -> Option<usize> {
+        self.cells.hit(pos)
+    }
+
+    /// Where button `i` last drew, so a test can click it without knowing
+    /// the layout math.
+    pub fn cell(&self, i: usize) -> Option<Rect> {
+        self.cells.cell(i)
     }
 
     /// ←/→ (h/l) move; ↵ fires the selected one. Nothing else — a letter
@@ -597,6 +624,7 @@ impl Buttons {
         const GAP: u16 = 2;
         let w = self.labels.iter().map(|l| l.chars().count() as u16).max().unwrap_or(6) + 6;
         let mut x = area.x;
+        self.cells.clear();
         for (i, label) in self.labels.iter().enumerate() {
             if x + w > area.x + area.width {
                 break; // too narrow to draw the rest; nothing is clipped mid-border
@@ -604,6 +632,7 @@ impl Buttons {
             let accent = self.colors.get(i).copied().unwrap_or(Color::Gray);
             let armed = focused && i == self.sel;
             let cell = Rect { x, y: area.y, width: w, height: 3.min(area.height) };
+            self.cells.push(i, cell);
             let block = boxed("", Style::new()).border_style(Style::new().fg(accent));
             let inner = block.inner(cell);
             f.render_widget(block, cell);
@@ -629,10 +658,44 @@ pub fn scrolled(s: &mut Scroll, d: i32) -> Option<Go> {
 }
 
 /// Which cell contains `pos`, if any. One hit-test for every clickable row
-/// of rects: `tab_strip`'s cells today, `Buttons` and list rows next. Reuses
-/// whatever geometry the render pass already produced.
+/// of plain rects: `tab_strip`'s cells today. Reuses whatever geometry the
+/// render pass already produced.
 pub fn hit_test(cells: &[Rect], pos: Position) -> Option<usize> {
     cells.iter().position(|r| r.contains(pos))
+}
+
+/// The rects a render pass drew, keyed by whatever identifies each one — a
+/// button index, a panel number, a focus enum. `clear`+`push` once per
+/// render; `hit` finds which key a click landed in, `cell` is the reverse
+/// (a test clicking something without knowing the layout math). Interior
+/// mutability because render only ever holds `&self`.
+///
+/// One definition instead of a `RefCell<Vec<(K, Rect)>>` and its two lookups
+/// re-typed on every focusable widget.
+pub struct Cells<K>(RefCell<Vec<(K, Rect)>>);
+
+impl<K> Default for Cells<K> {
+    fn default() -> Self {
+        Self(RefCell::new(Vec::new()))
+    }
+}
+
+impl<K: Copy + PartialEq> Cells<K> {
+    pub fn clear(&self) {
+        self.0.borrow_mut().clear();
+    }
+
+    pub fn push(&self, key: K, rect: Rect) {
+        self.0.borrow_mut().push((key, rect));
+    }
+
+    pub fn hit(&self, pos: Position) -> Option<K> {
+        self.0.borrow().iter().find(|(_, r)| r.contains(pos)).map(|(k, _)| *k)
+    }
+
+    pub fn cell(&self, key: K) -> Option<Rect> {
+        self.0.borrow().iter().find(|(k, _)| *k == key).map(|(_, r)| *r)
+    }
 }
 
 /// Put text on the system clipboard. No dependency: every desktop ships a

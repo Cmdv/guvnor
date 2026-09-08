@@ -4,7 +4,7 @@
 use crate::review::Review;
 use crate::state::{self, State};
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Padding, Paragraph, Row, Table, TableState, Wrap};
@@ -56,12 +56,23 @@ pub struct ReviewView {
     /// Which section `tab` has focus on. Only the findings section takes a
     /// cursor; the other two are read-only panes that scroll.
     pub focus: ReviewFocus,
+    /// Focused pane fills the tab, tmux-style; esc unzooms.
+    pub zoomed: bool,
     pub summary_scroll: Scroll,
     pub cost_scroll: Scroll,
     /// The landing surface, as a box at the foot of this tab. `Some` once every
     /// gate is green (ready to stage), `None` while it is still muted — you can
     /// focus it either way (`s`), but only a `Some` one has buttons that fire.
     pub stage: Option<StageView>,
+    /// Each pane's last-drawn rect, for a click to hit.
+    cells: Cells<ReviewFocus>,
+    /// Each finding row's last-drawn rect, for a click to select it.
+    finding_cells: Cells<usize>,
+    /// Each finding's checkbox glyph, narrower than the row — a click there
+    /// wins over the row and toggles instead of only selecting.
+    check_cells: Cells<usize>,
+    /// The instruction box's last-drawn rect, so a click can focus it.
+    note_cell: std::cell::Cell<Rect>,
 }
 
 /// Sections of the review screen, cycled with `tab`. Boxes that can hold more
@@ -116,6 +127,56 @@ impl ReviewView {
             ReviewFocus::Cost => Some(&mut self.cost_scroll),
         }
     }
+
+    /// Findings focused, unzoomed, cursor on the first finding — or the
+    /// actions if there are none, never the note box.
+    pub fn focus_findings(&mut self) {
+        self.focus = ReviewFocus::Findings;
+        self.zoomed = false;
+        self.sel = if self.live.is_empty() { self.action_row() } else { 0 };
+    }
+
+    /// The pane a click at `pos` hits, if the last render drew one there.
+    pub fn hit(&self, pos: Position) -> Option<ReviewFocus> {
+        self.cells.hit(pos)
+    }
+
+    /// Where `focus` last drew, so a test can click it without knowing the
+    /// layout math.
+    pub fn cell(&self, focus: ReviewFocus) -> Option<Rect> {
+        self.cells.cell(focus)
+    }
+
+    /// The finding row a click at `pos` hits, if the last render drew one there.
+    pub fn finding_hit(&self, pos: Position) -> Option<usize> {
+        self.finding_cells.hit(pos)
+    }
+
+    /// Where finding `i`'s row last drew, so a test can click it.
+    pub fn finding_cell(&self, i: usize) -> Option<Rect> {
+        self.finding_cells.cell(i)
+    }
+
+    /// The finding whose checkbox a click at `pos` hits, if any.
+    pub fn check_hit(&self, pos: Position) -> Option<usize> {
+        self.check_cells.hit(pos)
+    }
+
+    /// Where finding `i`'s checkbox last drew, so a test can click it.
+    pub fn check_cell(&self, i: usize) -> Option<Rect> {
+        self.check_cells.cell(i)
+    }
+
+    /// Whether a click at `pos` hit the instruction box.
+    pub fn note_hit(&self, pos: Position) -> bool {
+        self.note_cell.get().contains(pos)
+    }
+
+    /// Where the instruction box last drew, so a test can click it without
+    /// knowing the layout math.
+    pub fn note_rect(&self) -> Rect {
+        self.note_cell.get()
+    }
 }
 
 /// What the Review tab did with a key. `No` matters: the tab strip is shared
@@ -143,20 +204,20 @@ pub fn review_key(r: &mut ReviewView, key: &KeyEvent) -> Took {
         }
         _ => {}
     }
-    // Jump straight to a section by its red letter — everywhere except the
-    // instruction line, where the letters are text. The buttons take no letters,
-    // so nothing else competes for them.
+    // 1-4 jump and zoom, Spec-tab style — everywhere except the instruction
+    // line, where digits are text.
     let typing = r.focus == ReviewFocus::Findings && r.sel == r.note_row();
     if !typing {
         let jump = match key.code {
-            KeyCode::Char('f') => Some(ReviewFocus::Findings),
-            KeyCode::Char('r') => Some(ReviewFocus::Summary),
-            KeyCode::Char('t') => Some(ReviewFocus::Cost),
-            KeyCode::Char('s') => Some(ReviewFocus::Stage),
+            KeyCode::Char('1') => Some(ReviewFocus::Findings),
+            KeyCode::Char('2') => Some(ReviewFocus::Summary),
+            KeyCode::Char('3') => Some(ReviewFocus::Cost),
+            KeyCode::Char('4') => Some(ReviewFocus::Stage),
             _ => None,
         };
         if let Some(to) = jump {
             r.focus = to;
+            r.zoomed = true;
             return Took::Yes;
         }
     }
@@ -298,11 +359,33 @@ pub fn review_key(r: &mut ReviewView, key: &KeyEvent) -> Took {
     }
 }
 
+/// A zoomed box gets an esc hint; the grid's numbers are hint enough on their own.
+fn zoom_hint(v: &ReviewView) -> Option<Line<'static>> {
+    v.zoomed.then(|| hint_line(&[("esc", "unzoom")]))
+}
+
 /// The Review tab: what was flagged (with the controls to act on it), then
 /// the reviewer's reasoning and the spend side by side — two short, unrelated
 /// things side by side, so each gets the height it needs — and the decision
-/// last, as a conclusion.
+/// last, as a conclusion. Zoomed, one pane takes the whole tab instead.
 pub fn render_review_tab(f: &mut Frame, area: Rect, v: &ReviewView) {
+    if v.zoomed {
+        v.cells.clear();
+        v.cells.push(v.focus, area);
+        // Cleared unconditionally: if Findings isn't the zoomed pane its
+        // render fn (the only place that repopulates these) won't run this
+        // frame, and a stale rect could wrongly catch a click meant for
+        // whatever pane is actually showing.
+        v.finding_cells.clear();
+        v.check_cells.clear();
+        match v.focus {
+            ReviewFocus::Findings => render_findings(f, area, v),
+            ReviewFocus::Summary => render_summary(f, area, v),
+            ReviewFocus::Cost => render_cost(f, area, v),
+            ReviewFocus::Stage => render_stage_box(f, area, v),
+        }
+        return;
+    }
     // The comment and the ledger take what their content needs and never more
     // than half the screen — they are reference material, and the findings are
     // the thing you act on. Everything left over goes to the findings.
@@ -347,17 +430,34 @@ pub fn render_review_tab(f: &mut Frame, area: Rect, v: &ReviewView) {
     let [sum_a, cost_a] =
         Layout::horizontal([Constraint::Min(30), Constraint::Length(COST_W)]).areas(panes_a);
 
-    // findings box holds the whole control surface: the list, then an
-    // unnamed instruction box, then the button — you never leave it
+    v.cells.clear();
+    v.cells.push(ReviewFocus::Findings, find_a);
+    v.cells.push(ReviewFocus::Summary, sum_a);
+    v.cells.push(ReviewFocus::Cost, cost_a);
+    v.cells.push(ReviewFocus::Stage, stage_a);
+    v.finding_cells.clear();
+    v.check_cells.clear();
+    render_findings(f, find_a, v);
+    render_summary(f, sum_a, v);
+    render_cost(f, cost_a, v);
+    render_stage_box(f, stage_a, v);
+}
+
+/// findings box holds the whole control surface: the list, then an unnamed
+/// instruction box, then the button — you never leave it.
+pub fn render_findings(f: &mut Frame, area: Rect, v: &ReviewView) {
     let picked = v.checked.iter().filter(|c| **c).count();
     let on_findings = v.focus == ReviewFocus::Findings;
-    let find_box = focus_box(
-        "f",
-        &format!("findings — {picked} of {} ticked to fix", v.live.len()),
+    let mut find_box = focus_box(
+        "1",
+        &format!("1 findings — {picked} of {} ticked to fix", v.live.len()),
         on_findings,
     );
-    let find_inner = find_box.inner(find_a);
-    f.render_widget(find_box, find_a);
+    if let Some(hint) = zoom_hint(v) {
+        find_box = find_box.title_bottom(hint);
+    }
+    let find_inner = find_box.inner(area);
+    f.render_widget(find_box, area);
     let [top_a, note_a, btn_a] =
         Layout::vertical([Constraint::Min(4), Constraint::Length(4), Constraint::Length(3)])
             .areas(find_inner);
@@ -423,6 +523,26 @@ pub fn render_review_tab(f: &mut Frame, area: Rect, v: &ReviewView) {
     let yoff = (v.sel.min(last) as u16).saturating_sub(list_inner.height.saturating_sub(1));
     f.render_widget(Paragraph::new(list).scroll((yoff, 0)), list_inner);
 
+    // One rect per visible finding row, and a narrower one over just its
+    // checkbox — a click there wins the hit-test and toggles; anywhere else
+    // on the row only selects it (so the why-pane follows the click).
+    for i in 0..v.live.len() {
+        let row = i as u16;
+        if row < yoff {
+            continue;
+        }
+        let rel = row - yoff;
+        if rel >= list_inner.height {
+            break;
+        }
+        let y = list_inner.y + rel;
+        v.finding_cells.push(i, Rect { x: list_inner.x, y, width: list_inner.width, height: 1 });
+        // " ▸ " (3 cols) then the "[x] "/"[ ] " glyph (4 cols).
+        let cx = list_inner.x + 3;
+        let cw = 4.min(list_inner.width.saturating_sub(3));
+        v.check_cells.push(i, Rect { x: cx, y, width: cw, height: 1 });
+    }
+
     // The reason, for whichever finding the cursor is on — its own box, titled
     // with the file it is about, so the body is only the reviewer's words.
     let (title, style, why) = match v.live.get(v.sel) {
@@ -456,6 +576,7 @@ pub fn render_review_tab(f: &mut Frame, area: Rect, v: &ReviewView) {
     let note_box = boxed("", Style::new())
         .border_style(Style::new().fg(if on_note { Color::White } else { MODAL_BORDER }));
     let note_inner = note_box.inner(note_a);
+    v.note_cell.set(note_inner);
     f.render_widget(note_box, note_a);
     let (xoff, cx) = hscroll(v.note.cursor, note_inner.width as usize);
     let hint = if v.note.value.is_empty() && !on_note {
@@ -471,15 +592,18 @@ pub fn render_review_tab(f: &mut Frame, area: Rect, v: &ReviewView) {
         f.set_cursor_position(Position::new(note_inner.x + cx, note_inner.y));
     }
     v.buttons.render(f, btn_a, on_findings && v.sel == v.action_row());
+}
 
-    let sum_box = focus_box("r", "reviewer comment", v.focus == ReviewFocus::Summary);
-    let sum_inner = sum_box.inner(sum_a);
+pub fn render_summary(f: &mut Frame, area: Rect, v: &ReviewView) {
+    let mut sum_box = focus_box("2", "2 reviewer comment", v.focus == ReviewFocus::Summary);
+    if let Some(hint) = zoom_hint(v) {
+        sum_box = sum_box.title_bottom(hint);
+    }
+    let sum_inner = sum_box.inner(area);
     let prose = Paragraph::new(v.summary.clone()).wrap(Wrap { trim: false });
     let off = v.summary_scroll.fit(prose.line_count(sum_inner.width), sum_inner.height);
-    f.render_widget(prose.scroll((off, 0)).block(sum_box), sum_a);
-
-    render_cost(f, cost_a, v);
-    render_stage_box(f, stage_a, v);
+    f.render_widget(prose.scroll((off, 0)).block(sum_box), area);
+    v.summary_scroll.render_bar(f, area.inner(Margin { vertical: 1, horizontal: 0 }));
 }
 
 /// The landing box at the foot of the Review tab. Greyed and inert until every
@@ -487,13 +611,14 @@ pub fn render_review_tab(f: &mut Frame, area: Rect, v: &ReviewView) {
 /// happen, and offers the moves the tree is in a state for. `s` focuses it.
 pub fn render_stage_box(f: &mut Frame, area: Rect, v: &ReviewView) {
     let focused = v.focus == ReviewFocus::Stage;
-    // Lowercase title so `focus_box`'s red-key highlighter (`title.find("s")`)
-    // lands the `s` on "stage", the way f/r/t do on their sibling boxes.
     let Some(s) = &v.stage else {
         // Muted: visible so you know landing is coming, greyed so you know it
         // isn't yet. `focus_box(.., false)` keeps it grey even when focused.
-        let block = focus_box("s", "stage — locked until every gate is green", false)
+        let mut block = focus_box("4", "4 stage — locked until every gate is green", false)
             .padding(Padding::new(0, 0, 1, 0));
+        if let Some(hint) = zoom_hint(v) {
+            block = block.title_bottom(hint);
+        }
         f.render_widget(
             Paragraph::new(Line::styled(
                 " approve Spec · Tests · Work to land — each gate gates the commit",
@@ -511,7 +636,11 @@ pub fn render_stage_box(f: &mut Frame, area: Rect, v: &ReviewView) {
     } else {
         format!("{} file(s) ready", s.files.len())
     };
-    let block = focus_box("s", &format!("stage — {state}"), focused).padding(Padding::new(0, 0, 1, 0));
+    let mut block =
+        focus_box("4", &format!("4 stage — {state}"), focused).padding(Padding::new(0, 0, 1, 0));
+    if let Some(hint) = zoom_hint(v) {
+        block = block.title_bottom(hint);
+    }
     let inner = block.inner(area);
     f.render_widget(block, area);
     let btn_h = if s.buttons.labels.is_empty() { 0 } else { 3 };
@@ -534,6 +663,7 @@ pub fn render_stage_box(f: &mut Frame, area: Rect, v: &ReviewView) {
         .collect();
     let off = s.scroll.fit(lines.len(), files_a.height);
     f.render_widget(Paragraph::new(lines).scroll((off, 0)), files_a);
+    s.scroll.render_bar(f, files_a);
     f.render_widget(Paragraph::new(words).wrap(Wrap { trim: false }), what_a);
     if btn_h > 0 {
         s.buttons.render(f, btn_a, focused);
@@ -559,8 +689,11 @@ pub fn verdict_means(d: crate::review::Decision) -> &'static str {
 /// in dollars to the cent, because fractions of a cent are not a decision.
 pub fn render_cost(f: &mut Frame, area: Rect, v: &ReviewView) {
     let dim = Style::new().fg(Color::DarkGray);
-    let block =
-        focus_box("t", "tokens / cost", v.focus == ReviewFocus::Cost).padding(Padding::new(0, 0, 1, 0));
+    let mut block = focus_box("3", "3 tokens / cost", v.focus == ReviewFocus::Cost)
+        .padding(Padding::new(0, 0, 1, 0));
+    if let Some(hint) = zoom_hint(v) {
+        block = block.title_bottom(hint);
+    }
     if v.cost.is_empty() {
         f.render_widget(
             Paragraph::new(Line::styled(" no metrics recorded", dim)).block(block),
@@ -605,6 +738,17 @@ pub fn render_cost(f: &mut Frame, area: Rect, v: &ReviewView) {
     .column_spacing(1)
     .block(block);
     f.render_stateful_widget(table, area, &mut state);
+    // Only the body rows scroll — the header and footer are fixed — so the
+    // bar rides the border alongside just those rows, not the whole box.
+    v.cost_scroll.render_bar(
+        f,
+        Rect {
+            x: area.x + area.width.saturating_sub(1),
+            y: inner.y + 1,
+            width: 1,
+            height: body_h,
+        },
+    );
 }
 
 impl App {
@@ -650,7 +794,7 @@ impl App {
 
         let done: Vec<String> = st.fixed_findings.iter().map(state::finding_key).collect();
         let live = r.verdict.findings;
-        Some(ReviewView {
+        let mut v = ReviewView {
             id: st.id.clone(),
             summary,
             cost,
@@ -669,11 +813,18 @@ impl App {
             // invent a default that doesn't exist.
             buttons: Buttons::new(&["fix the code", "change the spec"], PEERS),
             focus: ReviewFocus::Findings,
+            zoomed: false,
             summary_scroll: Scroll::default(),
             cost_scroll: Scroll::default(),
             // Attached by `build_case` once every gate is green; muted until then.
             stage: None,
-        })
+            cells: Cells::default(),
+            finding_cells: Cells::default(),
+            check_cells: Cells::default(),
+            note_cell: std::cell::Cell::new(Rect::default()),
+        };
+        v.focus_findings();
+        Some(v)
     }
 
 }
@@ -700,12 +851,19 @@ impl ReviewView {
             reraised: vec![false; n],
             resolved: Vec::new(),
             note: LineInput::default(),
-            sel: 0,
+            // No findings means `note_row()` is 0 too; land on the actions,
+            // not the coincidentally-equal note row.
+            sel: if n == 0 { 1 } else { 0 },
             buttons: Buttons::new(&["fix the code", "change the spec"], PEERS),
             focus: ReviewFocus::Findings,
+            zoomed: false,
             summary_scroll: Scroll::default(),
             cost_scroll: Scroll::default(),
             stage,
+            cells: Cells::default(),
+            finding_cells: Cells::default(),
+            check_cells: Cells::default(),
+            note_cell: std::cell::Cell::new(Rect::default()),
         }
     }
 }

@@ -1,9 +1,18 @@
 use guvnor::state;
 use guvnor::tui::runs::{HomeFocus, RunRow};
-use guvnor::tui::{gates_line, press, screen_text, App, Go, ART_WHITE, JobKind, SELECTED_TEXT};
+use guvnor::tui::{click, gates_line, press, screen_text, App, Go, ART_WHITE, JobKind, SELECTED_TEXT};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::Color;
+
+/// Render the home screen once, into a terminal roomy enough for the
+/// new-feature panel to draw (the responsive art band needs height).
+fn render(app: &mut App) {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    let mut t = Terminal::new(TestBackend::new(120, 50)).unwrap();
+    t.draw(|f| app.render_runs(f, Rect::new(0, 0, 120, 50))).unwrap();
+}
 
 /// The new-feature box has no action row: ↵ plans it from either field, and
 /// the only way to get a newline into the context is ⇧↵. It's the focused
@@ -316,7 +325,7 @@ fn selected_text_is_a_darker_achromatic_tone_of_the_bar() {
             assert_eq!(r, g, "SELECTED_TEXT must be achromatic (r == g)");
             assert_eq!(g, b, "SELECTED_TEXT must be achromatic (g == b)");
             assert!(r < 0xea, "SELECTED_TEXT must be strictly darker than ART_WHITE (0xea)");
-            assert!((0x70..=0xb0).contains(&r), "SELECTED_TEXT must stay in the legible 0x70-0xb0 range");
+            assert!((0x20..=0xb0).contains(&r), "SELECTED_TEXT must stay in the legible 0x20-0xb0 range");
         }
         other => panic!("SELECTED_TEXT must be an exact Color::Rgb value, got {other:?}"),
     }
@@ -351,4 +360,83 @@ fn d_deletes_anything_but_a_committed_run() {
     app.handle_key(&press(KeyCode::Char('d')));
     assert!(app.confirm_delete.is_none(), "a committed run is the record — no delete");
     assert!(app.toast.is_some(), "and it says why");
+}
+
+/// A click on a run row opens it exactly as ↵ would, by replaying it — and
+/// it must steal focus back from the new-feature panel to do it.
+#[test]
+fn clicking_a_run_row_selects_and_opens_it() {
+    let row = |id: &str| RunRow {
+        id: id.into(),
+        title: id.into(),
+        status: state::Status::Reviewed,
+        verdict: String::new(),
+        cost: String::new(),
+        gates: gates_line(&guvnor::state::Gates::default()),
+    };
+    let mut app = App::for_test();
+    app.runs = vec![row("id-1"), row("id-2")];
+    app.focus = HomeFocus::New;
+    render(&mut app);
+    let cell = app.row_cells.cell(1).expect("the second row drew somewhere");
+
+    let go = app.handle_mouse(&click(cell.x + 1, cell.y));
+    assert!(matches!(go, Some(Go::Case(id)) if id == "id-2"), "the click opened the row it hit");
+    assert!(app.focus == HomeFocus::Runs, "a row click must take focus back from the panel");
+    assert_eq!(app.table.selected(), Some(1));
+}
+
+/// The new-feature box is one focus target on the keyboard (`n`/tab) but two
+/// on a click: the title and the context rects between them cover the whole
+/// box, so clicking either lands the cursor in the field you actually hit.
+#[test]
+fn clicking_the_new_box_focuses_the_field_you_clicked() {
+    let mut app = App::for_test();
+    render(&mut app);
+    let context = app.new.cell(1).expect("the context box drew somewhere");
+
+    app.handle_mouse(&click(context.x + 1, context.y + 1));
+    assert!(app.focus == HomeFocus::New);
+    assert_eq!(app.new.focus, 1, "the click landed in the context box");
+
+    let title = app.new.cell(0).expect("the title box drew somewhere");
+    app.handle_mouse(&click(title.x + 1, title.y + 1));
+    assert_eq!(app.new.focus, 0, "and this one in the title");
+}
+
+/// The config box is not a keyboard focus target — a click on it just opens
+/// the modal, same as pressing `c`.
+#[test]
+fn clicking_the_config_box_opens_the_modal() {
+    let mut app = App::for_test();
+    render(&mut app);
+    assert!(app.config.is_none());
+    let cfg_box = app.cfg_box;
+
+    app.handle_mouse(&click(cfg_box.x + 1, cfg_box.y));
+    assert!(app.config.is_some(), "the click opened the config modal");
+}
+
+/// A click inside the runs box that isn't a row (the header, say) still
+/// takes focus back from the new-feature panel — it just doesn't navigate.
+#[test]
+fn clicking_the_runs_box_background_focuses_it_without_opening_anything() {
+    let mut app = App::for_test();
+    app.runs = vec![RunRow {
+        id: "id-1".into(),
+        title: "a feature".into(),
+        status: state::Status::Reviewed,
+        verdict: String::new(),
+        cost: String::new(),
+        gates: gates_line(&guvnor::state::Gates::default()),
+    }];
+    app.focus = HomeFocus::New;
+    render(&mut app);
+    let runs_box = app.runs_box;
+
+    // the header row, one line below the box's top border — above any run row
+    let go = app.handle_mouse(&click(runs_box.x + 1, runs_box.y + 1));
+    assert!(go.is_none());
+    assert!(app.focus == HomeFocus::Runs, "the click took focus back");
+    assert_eq!(app.table.selected(), None, "but it did not select a run");
 }

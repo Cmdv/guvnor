@@ -5,11 +5,12 @@
 
 use crate::spec::Spec;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Padding, Paragraph};
 use ratatui::Frame;
+use std::cell::Cell;
 
 use super::*;
 
@@ -19,6 +20,8 @@ pub struct Prompt {
     pub text: TextArea,
     pub buttons: Buttons,
     pub on_buttons: bool,
+    /// The text box's last-drawn rect, so a click can focus it.
+    pub text_cell: Cell<Rect>,
 }
 
 impl Default for Prompt {
@@ -27,6 +30,7 @@ impl Default for Prompt {
             text: TextArea::default(),
             buttons: Buttons::new(&["send", "cancel"], YES_NO),
             on_buttons: false,
+            text_cell: Cell::new(Rect::default()),
         }
     }
 }
@@ -42,9 +46,22 @@ pub struct SpecPanels {
     pub focus: usize,
     pub zoomed: bool,
     pub scrolls: [Scroll; 6],
+    /// Each box's last-drawn rect, for a click to hit.
+    cells: Cells<usize>,
 }
 
 impl SpecPanels {
+    /// The box a click at `pos` hits, if the last render drew one there.
+    pub fn hit(&self, pos: Position) -> Option<usize> {
+        self.cells.hit(pos)
+    }
+
+    /// Where box `i` last drew, so a test can click it without knowing the
+    /// layout math.
+    pub fn cell(&self, i: usize) -> Option<Rect> {
+        self.cells.cell(i)
+    }
+
     /// `1`-`6` jump and zoom, tab/backtab walk to the next/previous box
     /// (zoomed or not — whichever box has the cursor is the one shown),
     /// arrows scroll the box they land on. Returns whether the key was ours,
@@ -107,6 +124,7 @@ pub fn panel_rows(width: u16) -> Vec<Vec<usize>> {
 /// the zoomed full-tab view, which differ only in the `Rect` they get and
 /// whether there's a bottom hint (the grid's numbers are already the hint).
 fn render_panel(f: &mut Frame, cell: Rect, i: usize, s: &[SpecSection], p: &SpecPanels, bottom: Option<Line<'static>>) {
+    p.cells.push(i, cell);
     let focused = i == p.focus;
     let (border, text) = if focused {
         (Color::White, Style::new().fg(Color::White).bold())
@@ -134,6 +152,7 @@ fn render_panel(f: &mut Frame, cell: Rect, i: usize, s: &[SpecSection], p: &Spec
     let wrapped = hang_wrap_all(&s[i].body, inner.width.max(1) as usize);
     let off = p.scrolls[i].fit(wrapped.len(), inner.height);
     f.render_widget(Paragraph::new(wrapped).scroll((off, 0)).block(block), cell);
+    p.scrolls[i].render_bar(f, cell.inner(Margin { vertical: 1, horizontal: 0 }));
 }
 
 /// The spec as boxes. Zoomed, the focused one fills `area` alone. Otherwise
@@ -142,6 +161,7 @@ fn render_panel(f: &mut Frame, cell: Rect, i: usize, s: &[SpecSection], p: &Spec
 /// anything that still doesn't fit is scrolled inside its own box.
 pub fn render_spec_panels(f: &mut Frame, area: Rect, sp: &Spec, p: &SpecPanels) {
     let s = spec_sections(sp);
+    p.cells.clear();
     if p.zoomed {
         render_panel(f, area, p.focus, &s, p, Some(hint_line(&[("esc", "unzoom")])));
         return;
@@ -151,7 +171,10 @@ pub fn render_spec_panels(f: &mut Frame, area: Rect, sp: &Spec, p: &SpecPanels) 
     // it will actually get. 2 border rows + 2 padding columns per box.
     let cell_w = area.width / rows.iter().map(|r| r.len()).max().unwrap_or(1) as u16;
     let need = |i: usize| {
-        hang_wrap_all(&s[i].body, cell_w.saturating_sub(4).max(1) as usize).len() as u16 + 2
+        let n = hang_wrap_all(&s[i].body, cell_w.saturating_sub(4).max(1) as usize).len() as u16;
+        // Verification is one line (the test command) but a single-row box
+        // reads as cramped next to its neighbours — floor it to two.
+        (if i == 4 { n.max(2) } else { n }) + 2
     };
     let mut weights: Vec<u16> =
         rows.iter().map(|r| r.iter().map(|&i| need(i)).max().unwrap_or(3).max(3)).collect();
