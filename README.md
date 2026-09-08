@@ -42,7 +42,7 @@ and paths, and a model preset (max/balanced/budget) for the three seats —
 planner, worker, reviewer — or type your own values for any of it. Saving
 writes `.guvnor/guvnor.toml`.
 
-<!-- screenshot: home screen, unconfigured, config modal open -->
+![Home screen, unconfigured, with the config modal open](screenshots/home_unconfigured.png)
 
 ### 2. Describe the feature
 
@@ -51,7 +51,7 @@ Press `n` to focus it, type a title and, if it helps, a paragraph of context
 or constraints. `↵` sends it to the planner, which drafts a five-part spec:
 Objective, Files, Interfaces, Constraints, Verification.
 
-<!-- screenshot: home screen, new-feature box focused -->
+![Home screen, the new-feature box focused with a title and context typed in](screenshots/home_new_feature.png)
 
 ### 3. Read the spec, argue with it
 
@@ -61,7 +61,7 @@ exists yet, so there's nothing to invalidate. Happy with it? `↵` approves the
 spec. Approval binds to that exact text — edit it later and you'll be asked
 to approve it again.
 
-<!-- screenshot: spec tab -->
+![The Spec tab: Objective, Files, Interfaces, Constraints, Verification, and Acceptance criteria](screenshots/run_spec_results.png)
 
 ### 4. Run it
 
@@ -73,15 +73,15 @@ tests it's being checked against → a green gate (tests must now pass) → a
 reviewer that reads the diff and the green gate's own output, with no shell
 of its own.
 
-<!-- screenshot: progress screen, mid-run -->
+![The progress screen mid-run: the pipeline strip above the live lane feed](screenshots/run_progress.png)
 
 ### 5. Read Tests and Work
 
 Two tabs unlock as the evidence lands. Each is a file list, not a wall of
-diff: `↑↓` moves, `space` opens a file in place. `↵` on the tab you just
+diff: `↑↓` moves, `tab` opens a file in place. `↵` on the tab you just
 read judges it.
 
-<!-- screenshot: work tab, a file expanded -->
+![The Work tab with a file's diff expanded](screenshots/run_work.png)
 
 ### 6. Triage the review
 
@@ -91,7 +91,7 @@ patches only those, the green gate re-checks, and the reviewer looks again.
 Nothing left worth fixing, or happy to ship as-is? Approve the tab like the
 other two.
 
-<!-- screenshot: review tab, findings ticked -->
+![The Review tab: verdict, findings, reviewer comment, and the cost ledger](screenshots/run_review.png)
 
 ### 7. Stage, then commit
 
@@ -102,7 +102,7 @@ yourself. From there: commit (guvnor writes the message and the commit — it
 never pushes) or unstage (backs out cleanly; every artifact stays on disk
 either way).
 
-<!-- screenshot: stage box + commit modal -->
+![The stage box, staged and uncommitted, with the commit-message modal open](screenshots/run_commit.png)
 
 That's a run, start to finish.
 
